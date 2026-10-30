@@ -80,22 +80,6 @@ static void BXFloatVCamInit(void) {
                 }
             }
 
-            // 4.5 网络流（HLS）。填了 kBXDefaultStreamURL 就自动开播
-            if (kBXDefaultStreamURL.length) {
-                NSError *se = nil;
-                BOOL isRTSP = [kBXDefaultStreamURL hasPrefix:@"rtsp://"];
-                BOOL ok = isRTSP
-                    ? [[BXCaptureBridge shared] useRTSPURLString:kBXDefaultStreamURL error:&se]
-                    : [[BXCaptureBridge shared] useStreamURLString:kBXDefaultStreamURL error:&se];
-                if (!ok) {
-                    NSLog(@"[BXFloat][vcam] 流媒体启动失败: %@", se);
-                } else {
-                    [BXCaptureBridge shared].enabled = YES;
-                    BXFloatModule *t = [[BXFloatRegistry shared] moduleForKey:@"bx.rtsp.enabled"];
-                    if (t) { t.on = YES; [[BXFloatStore shared] setObject:@(YES) forKey:t.key]; }
-                }
-            }
-
             // 5. 开关与画面选项
             BXFloatStore *st = [BXFloatStore shared];
             NSNumber *en = [st objectForKey:@"bx.vcam.enabled"];
