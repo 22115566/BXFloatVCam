@@ -13,6 +13,7 @@ BXFloatVCam_FILES = Tweak.xm \
                     BXCore/BXSwizzle.m \
                     BXCore/BXFloatWindow.m \
                     BXCore/BXFloatMenuController.m \
+                    BXCore/BXPreviewWindow.m \
                     BXCore/BXFloatModule.m \
                     BXCore/BXFloatStore.m \
                     BXCore/BXVolumeShortcut.m \
