@@ -58,6 +58,17 @@
 
 #pragma mark - 启动
 
+// 同步打开（只在后台队列调用）
+static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "stimeout", "5000000", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    int ret = avformat_open_input(outFmt, url, NULL, &opts);
+    av_dict_free(&opts);
+    return ret;
+}
+
 - (BOOL)startWithURLString:(NSString *)urlString error:(NSError **)error {
     [self stop];
     if (!urlString.length) {
