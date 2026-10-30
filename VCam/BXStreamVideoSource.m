@@ -19,13 +19,12 @@
 @property (nonatomic, strong) CIContext *ciContext;
 @property (nonatomic, strong) dispatch_queue_t lockQueue;
 @property (nonatomic, strong) id timeObserver;
-@property (nonatomic, readwrite, copy) NSString *urlString;
-@property (nonatomic, readwrite) CGSize size;
 @end
 
 @implementation BXStreamVideoSource {
     CVPixelBufferPoolRef _pool;
     CGSize _poolSize;
+    NSString *_urlString;      // readonly 属性手写了 getter，需要显式声明 ivar
 }
 
 - (instancetype)init {
