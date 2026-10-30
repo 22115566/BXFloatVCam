@@ -20,5 +20,9 @@ static const BOOL kBXAttachEverywhere = YES;
 /// RTSP 不被 AVFoundation 支持，必须先转成 HLS。
 static NSString *const kBXDefaultStreamURL = @"rtsp://192.168.1.4:8554/live/123";
 
+/// 启动时自动连流。默认 NO —— 在启动阶段连网络会把主线程卡住，
+/// 导致系统判定启动超时直接杀进程。请从面板「RTSP 拉流」开关启动。
+static const BOOL kBXAutoStartStream = NO;
+
 static NSString *const kBXMenuTitle = @"百相 Lite";
 static NSString *const kBXVersion   = @"1.0.0";
