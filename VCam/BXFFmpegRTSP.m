@@ -22,7 +22,7 @@
 @interface BXFFmpegRTSP () {
     AVFormatContext *_fmt;
     AVCodecContext  *_dec;
-    SwsContext      *_sws;
+    struct SwsContext *_sws;
     int             _streamIndex;
     int             _srcW, _srcH;
     enum AVPixelFormat _srcFmt;
