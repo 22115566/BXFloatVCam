@@ -19,6 +19,8 @@
 @property (nonatomic, strong) CIContext *ciContext;
 @property (nonatomic, strong) dispatch_queue_t lockQueue;
 @property (nonatomic, strong) id timeObserver;
+@property (nonatomic, readwrite, copy) NSString *urlString;
+@property (nonatomic, readwrite) CGSize size;
 @end
 
 @implementation BXStreamVideoSource {
@@ -64,8 +66,8 @@
     item.preferredForwardBufferDuration = 0.5;
 
     NSDictionary *attrs = @{
-        kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     _output = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:attrs];
     [_output setSuppressesPlayerRendering:YES];
