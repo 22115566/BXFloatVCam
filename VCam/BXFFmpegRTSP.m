@@ -18,6 +18,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
+#include <unistd.h>
 
 @interface BXFFmpegRTSP () {
     AVFormatContext *_fmt;
@@ -135,27 +136,17 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
         return NO;
     }
 
+    // 注意：RTSP 的分辨率有时要等第一帧解码后才知道，
+    // 这里不强制要求宽高，sws 在第一帧时惰性创建。
     _srcW = _dec->width;
     _srcH = _dec->height;
     _srcFmt = _dec->pix_fmt;
-    if (_srcW <= 0 || _srcH <= 0) {
-        if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-3
-                                            userInfo:@{NSLocalizedDescriptionKey: @"分辨率无效"}];
-        [self stop];
-        return NO;
+    if (_srcW > 0 && _srcH > 0) {
+        _sws = sws_getContext(_srcW, _srcH, _srcFmt,
+                              _srcW, _srcH, AV_PIX_FMT_BGRA,
+                              SWS_BILINEAR, NULL, NULL, NULL);
+        self.size = CGSizeMake(_srcW, _srcH);
     }
-
-    _sws = sws_getContext(_srcW, _srcH, _srcFmt,
-                          _srcW, _srcH, AV_PIX_FMT_BGRA,
-                          SWS_BILINEAR, NULL, NULL, NULL);
-    if (!_sws) {
-        if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-4
-                                            userInfo:@{NSLocalizedDescriptionKey: @"sws 初始化失败"}];
-        [self stop];
-        return NO;
-    }
-
-    self.size = CGSizeMake(_srcW, _srcH);
     self.urlString = urlString;
     self.running = YES;
     _stopRequested = NO;
@@ -200,6 +191,22 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
 }
 
 - (void)publishFrame:(AVFrame *)frame bgra:(uint8_t *)bgra stride:(int)stride {
+    // 首帧才知道真实分辨率：惰性创建 sws
+    if (!_sws || frame->width != _srcW || frame->height != _srcH) {
+        if (_sws) { sws_freeContext(_sws); _sws = NULL; }
+        _srcW = frame->width;
+        _srcH = frame->height;
+        _srcFmt = (enum AVPixelFormat)frame->format;
+        _sws = sws_getContext(_srcW, _srcH, _srcFmt,
+                              _srcW, _srcH, AV_PIX_FMT_BGRA,
+                              SWS_BILINEAR, NULL, NULL, NULL);
+        self.size = CGSizeMake(_srcW, _srcH);
+        if (!_sws) {
+            NSLog(@"[BXRTSP] sws 创建失败 %dx%d fmt=%d", _srcW, _srcH, (int)_srcFmt);
+            return;
+        }
+    }
+
     uint8_t *dst[4] = { bgra, NULL, NULL, NULL };
     int dstStride[4] = { stride, 0, 0, 0 };
     sws_scale(_sws, (const uint8_t *const *)frame->data, frame->linesize,
