@@ -17,6 +17,44 @@ static const void *kBXOrigQueueKey    = &kBXOrigQueueKey;
 static void BXSetSampleBufferDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue);
 static id   BXGetSampleBufferDelegate(id self, SEL _cmd);
 
+
+// ─────────────────────────────────────────────────────────────
+//  把 BGRA 帧转成摄像头使用的像素格式。
+//  抖音的采集管线是按摄像头的 420f(全范围)/420v(视频范围) 建的，
+//  直接塞 BGRA 即使格式描述写对了，后面处理链也可能不认。
+// ─────────────────────────────────────────────────────────────
+static CVPixelBufferRef BXConvertPixelBuffer(CVPixelBufferRef src, OSType dstFmt) CF_RETURNS_RETAINED {
+    if (!src) return NULL;
+    OSType srcFmt = CVPixelBufferGetPixelFormatType(src);
+    if (srcFmt == dstFmt) return (CVPixelBufferRef)CFRetain(src);
+
+    size_t w = CVPixelBufferGetWidth(src);
+    size_t h = CVPixelBufferGetHeight(src);
+    if (w == 0 || h == 0) return NULL;
+
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(dstFmt),
+        (id)kCVPixelBufferWidthKey: @(w),
+        (id)kCVPixelBufferHeightKey: @(h),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, dstFmt,
+                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) {
+        return NULL;
+    }
+
+    static CIContext *ctx = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
+
+    CIImage *img = [CIImage imageWithCVPixelBuffer:src];
+    [ctx render:img toCVPixelBuffer:dst
+           bounds:CGRectMake(0, 0, w, h)
+       colorSpace:CGColorSpaceCreateDeviceRGB()];
+    return dst;
+}
+
 @interface BXCaptureBridge () <AVCaptureVideoDataOutputSampleBufferDelegate,
                               AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) BXVideoSource *source;
@@ -306,6 +344,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     } else {
         frame = [self.source copyNextFrameScaledTo:target];
     }
+    // 转换到摄像头用的像素格式（通常是 420f），让后面的格式描述能复用、处理链也认
+    OSType camPixelFmt = CVPixelBufferGetPixelFormatType(camPx);
+    CVPixelBufferRef converted = BXConvertPixelBuffer(frame, camPixelFmt);
+    if (converted) {
+        CVPixelBufferRelease(frame);
+        frame = converted;
+    }
+
     if (!frame) {
         static NSUInteger nullCount = 0;
         nullCount++;
@@ -325,22 +371,39 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      只替换图像内容，不要造一个干干净净的新 buffer。
      */
 
-    // 1) 尺寸一致时直接复用原 format description（保留所有扩展字段）
+    // 1) 复用原 format description —— 但必须「尺寸 + 像素格式」都一致。
+    //    摄像头一般是 420f（YUV），我们造的是 BGRA；把 420f 的 format description
+    //    套在 BGRA 缓冲上，CMSampleBufferCreateReadyWithImageBuffer 会直接校验失败返回 NULL，
+    //    表现就是「进入造帧很多次、已替换永远是 0」。
     CMFormatDescriptionRef origFmt = CMSampleBufferGetFormatDescription(in);
     CMFormatDescriptionRef fmt = NULL;
 
     size_t fw = CVPixelBufferGetWidth(frame);
     size_t fh = CVPixelBufferGetHeight(frame);
-    BOOL sizeMatches = NO;
+    OSType frameFmt = CVPixelBufferGetPixelFormatType(frame);
+
+    BOOL canReuse = NO;
     if (origFmt) {
         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(origFmt);
-        sizeMatches = ((size_t)d.width == fw && (size_t)d.height == fh);
+        OSType origSub = CMFormatDescriptionGetMediaSubType(origFmt);
+        canReuse = ((size_t)d.width == fw &&
+                    (size_t)d.height == fh &&
+                    origSub == frameFmt);
+        static OSType loggedSub = 0;
+        if (loggedSub != origSub) {
+            loggedSub = origSub;
+            NSLog(@"[BXFloat][vcam] 摄像头 format subtype=%c%c%c%c 我们的帧=%c%c%c%c",
+                  (char)(origSub >> 24), (char)(origSub >> 16), (char)(origSub >> 8), (char)origSub,
+                  (char)(frameFmt >> 24), (char)(frameFmt >> 16), (char)(frameFmt >> 8), (char)frameFmt);
+        }
     }
 
-    if (sizeMatches) {
+    if (canReuse) {
         fmt = (CMFormatDescriptionRef)CFRetain(origFmt);
     } else {
-        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt) != noErr) {
+        OSStatus fe = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
+        if (fe != noErr || !fmt) {
+            NSLog(@"[BXFloat][vcam] 建 format description 失败 %d", (int)fe);
             CVPixelBufferRelease(frame);
             return NULL;
         }
@@ -365,7 +428,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     CFRelease(fmt);
     CVPixelBufferRelease(frame);
     if (st != noErr || !out) {
-        NSLog(@"[BXFloat][vcam] CMSampleBufferCreateReadyWithImageBuffer 失败 %d", (int)st);
+        static int logCount = 0;
+        if (logCount < 5) {
+            logCount++;
+            NSLog(@"[BXFloat][vcam] CMSampleBufferCreateReadyWithImageBuffer 失败 st=%d fmt=%c%c%c%c %zux%zu",
+                  (int)st,
+                  (char)(frameFmt >> 24), (char)(frameFmt >> 16), (char)(frameFmt >> 8), (char)frameFmt,
+                  fw, fh);
+        }
         return NULL;
     }
 
