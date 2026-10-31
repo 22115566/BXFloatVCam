@@ -36,9 +36,13 @@
 
 @property (nonatomic, readonly) NSString *rtspURL;
 
+/// 进入造帧的次数（排查用）
+@property (nonatomic, readonly) NSUInteger attemptFrames;
+
 /// 解码统计（排查用）
 @property (nonatomic, readonly) NSUInteger decodedFrames;
 @property (nonatomic, readonly) NSString *streamFrameReason;
+@property (nonatomic, readonly) NSString *gateReason;
 
 /// 取当前 RTSP/HLS 帧（给预览窗复用，避免开第二路连接）
 - (CVPixelBufferRef)copyLatestStreamFrame CF_RETURNS_RETAINED;
