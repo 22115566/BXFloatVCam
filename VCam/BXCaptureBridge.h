@@ -52,6 +52,9 @@
 /// 取当前 RTSP/HLS 帧（给预览窗复用，避免开第二路连接）
 - (CVPixelBufferRef)copyLatestStreamFrame CF_RETURNS_RETAINED;
 
+/// 当前是否带独立音轨（本地视频或 RTSP）
+@property (nonatomic, readonly) BOOL hasOwnAudio;
+
 /// 停止 RTSP / 网络流（本地视频不受影响）
 - (void)stopNetworkSources;
 
