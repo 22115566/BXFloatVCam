@@ -65,6 +65,7 @@ static void *kBXPoolKey = &kBXPoolKey;
 
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        @"EnableHardwareAcceleratedVideoDecoder": @YES,   // 百相里有这个 key，走硬件解码
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     AVAssetReaderTrackOutput *out =
@@ -137,6 +138,7 @@ static void *kBXPoolKey = &kBXPoolKey;
 
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        @"EnableHardwareAcceleratedVideoDecoder": @YES,   // 百相里有这个 key，走硬件解码
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     AVAssetReaderTrackOutput *out =
