@@ -46,4 +46,7 @@
 /// 取最新一帧（已应用镜像/旋转/缩放）。调用方 CFRelease。
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
 
+/// 按摄像头 PTS 取帧并缩放到指定尺寸（用于对齐摄像头时间戳）
+- (CVPixelBufferRef)copyFrameForCameraPTS:(CMTime)cameraPTS scaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
+
 @end
