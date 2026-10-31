@@ -25,9 +25,23 @@
 @property (nonatomic, readonly) NSUInteger decodedFrames;
 @property (nonatomic, readonly) NSUInteger droppedFrames;
 
+/// 目标像素格式：设成摄像头的格式后，缩放会直接渲染成该格式，不再二次转换
+@property (nonatomic, assign) OSType targetFormat;
+
 /// 画面选项
 @property (atomic, assign) BOOL mirror;
 @property (atomic, assign) NSInteger rotation;
+
+/// 有没有音频轨
+- (BOOL)hasAudio;
+
+/// 按摄像头的实际参数配置重采样目标（百相的做法：先读 ASBD 再对齐）
+- (void)configureAudioSampleRate:(double)rate channels:(int)channels;
+/// 当前重采样输出的声道数
+- (int)audioChannels;
+
+/// 取最新音频（S16 交错，48kHz，双声道）。返回写入的帧数，0 表示暂时没有。
+- (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames;
 
 /// 取最新一帧（已应用镜像/旋转/缩放）。调用方 CFRelease。
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
