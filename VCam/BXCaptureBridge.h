@@ -23,6 +23,9 @@
 /// 是否启用虚拟摄像头（未启用时完全直通）
 @property (atomic, assign) BOOL enabled;
 
+/// 音频替换：YES = 用流里的声音（视频原声），NO = 保留麦克风
+@property (atomic, assign) BOOL audioReplace;
+
 /// 画面选项（转发到底层视频源）
 @property (atomic, assign) BOOL loop;
 @property (atomic, assign) BOOL mirror;
@@ -38,6 +41,7 @@
 
 /// 进入造帧的次数（排查用）
 @property (nonatomic, readonly) NSUInteger attemptFrames;
+@property (nonatomic, readonly) NSUInteger audioReplaced;
 
 /// 解码统计（排查用）
 @property (nonatomic, readonly) NSUInteger decodedFrames;
