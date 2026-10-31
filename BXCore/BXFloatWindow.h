@@ -24,6 +24,9 @@
 @property (nonatomic, strong, readonly) UIButton *bubble;
 @property (nonatomic, strong, readonly) BXFloatMenuController *menu;
 
+/// 有系统弹窗/选择器时置 YES：否则它们落在面板区域外会被 hitTest 穿透，表现为“点了没反应”
+@property (nonatomic, assign) BOOL allowAllTouches;
+
 /// 是否允许悬浮层接收触摸(展开时 YES，收起时只有球体区域 YES)
 - (BOOL)shouldReceiveTouch;
 
