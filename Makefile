@@ -20,6 +20,7 @@ BXFloatVCam_FILES = Tweak.xm \
                     VCam/BXVideoSource.m \
                     VCam/BXStreamVideoSource.m \
                     VCam/BXFFmpegRTSP.m \
+                    VCam/BXLocalAudio.m \
                     VCam/BXCaptureBridge.m \
                     BXModules/BXModules.m
 
