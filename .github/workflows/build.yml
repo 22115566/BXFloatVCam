@@ -14,13 +14,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Theos and SDKs
-        id: cache-theos
-        uses: actions/cache@v4
-        with:
-          path: ~/theos
-          key: theos-v1
-
       - name: Select Xcode
         run: |
           set -euo pipefail
@@ -31,7 +24,6 @@ jobs:
           clang --version | head -n 1
 
       - name: Install Theos
-        if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           THEOS_DIR="$HOME/theos"
@@ -41,7 +33,7 @@ jobs:
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS_DIR"
           mkdir -p "$THEOS_DIR/sdks"
 
-          curl -fL --retry 3 --retry-delay 5 -o /tmp/sdks.tar.gz \
+          curl -fL -o /tmp/sdks.tar.gz \
             https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
           tar xzf /tmp/sdks.tar.gz -C /tmp
           cp -R /tmp/sdks-master/*.sdk "$THEOS_DIR/sdks/" || true
