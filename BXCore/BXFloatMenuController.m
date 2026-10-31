@@ -39,6 +39,8 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 @property (nonatomic, strong) UIButton *btnRTSP;
 @property (nonatomic, strong) UIButton *btnPreview;
 @property (nonatomic, strong) UIButton *btnStatus;
+@property (nonatomic, strong) UIButton *btnPick;
+@property (nonatomic, strong) UIButton *btnURL;
 
 @property (nonatomic, assign) NSInteger source;   // 0 关闭 / 1 本地 / 2 RTSP
 @property (nonatomic, assign) BOOL busy;
@@ -111,6 +113,8 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
     _btnPreview = [self actionButton:@"预览流" tag:10];
     _btnStatus  = [self actionButton:@"运行状态" tag:11];
+    _btnPick    = [self actionButton:@"选择视频" tag:12];
+    _btnURL     = [self actionButton:@"流地址" tag:13];
 }
 
 - (UIButton *)sourceButton:(NSString *)title sub:(NSString *)sub tag:(NSInteger)tag {
@@ -145,7 +149,11 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:C_BLUE() forState:UIControlStateNormal];
-    SEL act = (tag == 10) ? @selector(previewTapped) : @selector(statusTapped);
+    SEL act = @selector(statusTapped);
+    if (tag == 10)      act = @selector(previewTapped);
+    else if (tag == 11) act = @selector(statusTapped);
+    else if (tag == 12) act = @selector(pickTapped);
+    else if (tag == 13) act = @selector(urlTapped);
     [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:b];
     return b;
@@ -181,8 +189,11 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     }
 
     CGFloat half = (cw - 10) / 2.0;
-    _btnPreview.frame = CGRectMake(pad, y, half, 44);
-    _btnStatus.frame  = CGRectMake(pad + half + 10, y, half, 44);
+    _btnPreview.frame = CGRectMake(pad, y, half, 42);
+    _btnStatus.frame  = CGRectMake(pad + half + 10, y, half, 42);
+    y += 50;
+    _btnPick.frame    = CGRectMake(pad, y, half, 42);
+    _btnURL.frame     = CGRectMake(pad + half + 10, y, half, 42);
 }
 
 #pragma mark - 动作
@@ -262,6 +273,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
             self.bridge.enabled = YES;
             [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
             [self refresh];
+            // 已有视频时，同时给一次更换入口（点「选择视频」也可以换）
         } else {
             [self presentPicker];
         }
@@ -393,6 +405,14 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         [self alert:@"载入视频失败" message:e.localizedDescription ?: @"未知"];
     }
     [self refresh];
+}
+
+- (void)pickTapped {
+    [self presentPicker];
+}
+
+- (void)urlTapped {
+    [self promptURL];
 }
 
 - (void)previewTapped {
