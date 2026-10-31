@@ -14,7 +14,6 @@
 @property (nonatomic, strong) AVAssetReaderTrackOutput *output;
 @property (nonatomic, strong) NSURL *url;
 @property (nonatomic, assign) BOOL loaded;
-@property (nonatomic, assign) BOOL loop;
 @property (nonatomic, strong) NSLock *lock;
 @end
 
