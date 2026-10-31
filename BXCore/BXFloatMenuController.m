@@ -1,13 +1,17 @@
 //
-//  BXFloatMenuController.m —— 极简稳定版（重写）
+//  BXFloatMenuController.m —— 百相风格面板（含快捷调整）
 //
-//  原则：
-//    1. 不用 UISwitch / UIScrollView，避免状态回写与重建导致的崩溃。
-//    2. 布局只在 viewDidLayoutSubviews 里算 frame，不重建视图。
-//    3. 弹窗统一从悬浮窗 rootViewController 出，全部 @try。
-//    4. 连流等耗时动作一律后台队列，主线程只改 UI。
-//    5. 状态面板显示 启用 / 已解码 / 进入造帧 / 已替换 / 直通 / 造帧 / 错误 / 判定，
-//       排查不用再看日志。
+//  布局对照百相 0.20.33：
+//    标题 + 蓝色圆形 X
+//    状态条（连接状态 / 地址）
+//    替换来源：关闭 / 本地视频 / RTSP 拉流
+//    快捷调整：镜像 / 旋转 / 声音来源（点击循环切换）
+//    底部动作：预览流 / 运行状态 / 选择视频 / 流地址
+//
+//  稳定性约定：
+//    · 不用 UISwitch、不用 UIScrollView，全部固定 frame
+//    · 布局只在 viewDidLayoutSubviews 里算，不重建视图
+//    · 弹窗统一从悬浮窗 rootViewController 出，全部 @try
 //
 
 #import "BXFloatMenuController.h"
@@ -37,6 +41,12 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 @property (nonatomic, strong) UIButton *btnNone;
 @property (nonatomic, strong) UIButton *btnLocal;
 @property (nonatomic, strong) UIButton *btnRTSP;
+
+@property (nonatomic, strong) UILabel *quickLabel;
+@property (nonatomic, strong) UIView *tileMirror;
+@property (nonatomic, strong) UIView *tileRotate;
+@property (nonatomic, strong) UIView *tileAudio;
+
 @property (nonatomic, strong) UIButton *btnPreview;
 @property (nonatomic, strong) UIButton *btnStatus;
 @property (nonatomic, strong) UIButton *btnPick;
@@ -64,45 +74,43 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     [self refresh];
 }
 
-- (CGFloat)W {
-    return self.view.bounds.size.width;
-}
+- (CGFloat)W { return self.view.bounds.size.width; }
 
 #pragma mark - 建 UI
 
 - (void)buildUI {
     _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _titleLabel.text = kBXMenuTitle;
-    _titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightBold];
+    _titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightBold];
     _titleLabel.textColor = C_TEXT();
     [self.view addSubview:_titleLabel];
 
     _closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
     _closeButton.backgroundColor = C_BLUE();
-    _closeButton.layer.cornerRadius = 17;
+    _closeButton.layer.cornerRadius = 16;
     _closeButton.tintColor = [UIColor whiteColor];
-    _closeButton.imageEdgeInsets = UIEdgeInsetsMake(9, 9, 9, 9);
+    _closeButton.imageEdgeInsets = UIEdgeInsetsMake(8, 8, 8, 8);
     [_closeButton setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
     [_closeButton addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_closeButton];
 
     _statusCard = [[UIView alloc] initWithFrame:CGRectZero];
     _statusCard.backgroundColor = C_CARD();
-    _statusCard.layer.cornerRadius = 12;
+    _statusCard.layer.cornerRadius = 10;
     [self.view addSubview:_statusCard];
 
     _statusIcon = [[UILabel alloc] initWithFrame:CGRectZero];
-    _statusIcon.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
+    _statusIcon.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
     _statusIcon.textAlignment = NSTextAlignmentCenter;
     [_statusCard addSubview:_statusIcon];
 
     _statusTitle = [[UILabel alloc] initWithFrame:CGRectZero];
-    _statusTitle.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _statusTitle.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     _statusTitle.textColor = C_TEXT();
     [_statusCard addSubview:_statusTitle];
 
     _statusDetail = [[UILabel alloc] initWithFrame:CGRectZero];
-    _statusDetail.font = [UIFont systemFontOfSize:11];
+    _statusDetail.font = [UIFont systemFontOfSize:10];
     _statusDetail.textColor = C_SUB();
     _statusDetail.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [_statusCard addSubview:_statusDetail];
@@ -110,6 +118,24 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     _btnNone  = [self sourceButton:@"关闭" sub:@"不替换摄像头" tag:0];
     _btnLocal = [self sourceButton:@"本地视频" sub:@"用相册里的视频替换" tag:1];
     _btnRTSP  = [self sourceButton:@"RTSP 拉流" sub:@"用你自己的流替换" tag:2];
+
+    _quickLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _quickLabel.text = @"快捷调整";
+    _quickLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    _quickLabel.textColor = C_SUB();
+    [self.view addSubview:_quickLabel];
+
+    _tileMirror = [self tileWithIcon:@"arrow.left.and.right.square" title:@"镜像"];
+    _tileRotate = [self tileWithIcon:@"rotate.right" title:@"旋转"];
+    _tileAudio  = [self tileWithIcon:@"speaker.wave.2.fill" title:@"声音来源"];
+
+    _tileMirror.tag = 20;
+    _tileRotate.tag = 21;
+    _tileAudio.tag  = 22;
+    for (UIView *t in @[_tileMirror, _tileRotate, _tileAudio]) {
+        [t addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                     action:@selector(tileTapped:)]];
+    }
 
     _btnPreview = [self actionButton:@"预览流" tag:10];
     _btnStatus  = [self actionButton:@"运行状态" tag:11];
@@ -121,17 +147,17 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.tag = tag;
     b.backgroundColor = C_CARD();
-    b.layer.cornerRadius = 12;
+    b.layer.cornerRadius = 10;
     b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    b.titleEdgeInsets = UIEdgeInsetsMake(-9, 14, 9, 0);
-    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    b.titleEdgeInsets = UIEdgeInsetsMake(-8, 12, 8, 0);
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:C_TEXT() forState:UIControlStateNormal];
     [b addTarget:self action:@selector(sourceTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *s = [[UILabel alloc] initWithFrame:CGRectZero];
     s.text = sub;
-    s.font = [UIFont systemFontOfSize:11];
+    s.font = [UIFont systemFontOfSize:10];
     s.textColor = C_SUB();
     s.tag = 99;
     s.userInteractionEnabled = NO;
@@ -141,19 +167,50 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     return b;
 }
 
+- (UIView *)tileWithIcon:(NSString *)icon title:(NSString *)title {
+    UIView *t = [[UIView alloc] initWithFrame:CGRectZero];
+    t.backgroundColor = C_BLUEBG();
+    t.layer.cornerRadius = 10;
+    t.userInteractionEnabled = YES;
+    [self.view addSubview:t];
+
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectZero];
+    iv.image = [UIImage systemImageNamed:icon];
+    iv.tintColor = C_BLUE();
+    iv.contentMode = UIViewContentModeScaleAspectFit;
+    iv.tag = 101;
+    [t addSubview:iv];
+
+    UILabel *name = [[UILabel alloc] initWithFrame:CGRectZero];
+    name.text = title;
+    name.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    name.textColor = C_TEXT();
+    name.tag = 102;
+    [t addSubview:name];
+
+    UILabel *val = [[UILabel alloc] initWithFrame:CGRectZero];
+    val.font = [UIFont systemFontOfSize:10];
+    val.textColor = C_SUB();
+    val.tag = 103;
+    [t addSubview:val];
+
+    return t;
+}
+
 - (UIButton *)actionButton:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.tag = tag;
-    b.backgroundColor = C_BLUEBG();
-    b.layer.cornerRadius = 12;
-    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    b.backgroundColor = C_CARD();
+    b.layer.cornerRadius = 10;
+    b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
     [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:C_BLUE() forState:UIControlStateNormal];
+    [b setTitleColor:C_TEXT() forState:UIControlStateNormal];
+
     SEL act = @selector(statusTapped);
     if (tag == 10)      act = @selector(previewTapped);
-    else if (tag == 11) act = @selector(statusTapped);
     else if (tag == 12) act = @selector(pickTapped);
     else if (tag == 13) act = @selector(urlTapped);
+
     [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:b];
     return b;
@@ -166,41 +223,57 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     CGFloat w = [self W];
     if (w < 100) return;
 
-    CGFloat pad = 16;
+    CGFloat pad = 14;
     CGFloat cw = w - pad * 2;
-    CGFloat y = 16;
+    CGFloat y = 12;
 
-    _titleLabel.frame = CGRectMake(pad, y, cw - 46, 28);
-    _closeButton.frame = CGRectMake(w - pad - 34, y - 2, 34, 34);
-    y += 38;
+    _titleLabel.frame = CGRectMake(pad, y, cw - 44, 26);
+    _closeButton.frame = CGRectMake(w - pad - 32, y - 2, 32, 32);
+    y += 34;
 
-    _statusCard.frame = CGRectMake(pad, y, cw, 52);
-    _statusIcon.frame = CGRectMake(12, 15, 22, 22);
-    _statusTitle.frame = CGRectMake(40, 10, cw - 56, 18);
-    _statusDetail.frame = CGRectMake(40, 28, cw - 56, 14);
-    y += 62;
+    _statusCard.frame = CGRectMake(pad, y, cw, 46);
+    _statusIcon.frame = CGRectMake(10, 13, 20, 20);
+    _statusTitle.frame = CGRectMake(36, 8, cw - 46, 16);
+    _statusDetail.frame = CGRectMake(36, 24, cw - 46, 14);
+    y += 54;
 
-    NSArray *arr = @[_btnNone, _btnLocal, _btnRTSP];
-    for (UIButton *b in arr) {
-        b.frame = CGRectMake(pad, y, cw, 52);
+    for (UIButton *b in @[_btnNone, _btnLocal, _btnRTSP]) {
+        b.frame = CGRectMake(pad, y, cw, 44);
         UILabel *sub = [b viewWithTag:99];
-        sub.frame = CGRectMake(14, 28, cw - 28, 14);
-        y += 58;
+        sub.frame = CGRectMake(12, 24, cw - 24, 12);
+        y += 50;
     }
 
-    CGFloat half = (cw - 10) / 2.0;
-    _btnPreview.frame = CGRectMake(pad, y, half, 42);
-    _btnStatus.frame  = CGRectMake(pad + half + 10, y, half, 42);
-    y += 50;
-    _btnPick.frame    = CGRectMake(pad, y, half, 42);
-    _btnURL.frame     = CGRectMake(pad + half + 10, y, half, 42);
+    y += 4;
+    _quickLabel.frame = CGRectMake(pad, y, cw, 14);
+    y += 20;
+
+    CGFloat gap = 8;
+    CGFloat tw = (cw - gap * 2) / 3.0;
+    NSArray *tiles = @[_tileMirror, _tileRotate, _tileAudio];
+    for (NSInteger i = 0; i < 3; i++) {
+        UIView *t = tiles[i];
+        t.frame = CGRectMake(pad + i * (tw + gap), y, tw, 62);
+        UIImageView *iv = [t viewWithTag:101];
+        UILabel *name = [t viewWithTag:102];
+        UILabel *val = [t viewWithTag:103];
+        iv.frame = CGRectMake(8, 8, 18, 18);
+        name.frame = CGRectMake(8, 30, tw - 16, 14);
+        val.frame = CGRectMake(8, 44, tw - 16, 12);
+    }
+    y += 68;
+
+    CGFloat half = (cw - gap) / 2.0;
+    _btnPreview.frame = CGRectMake(pad, y, half, 38);
+    _btnStatus.frame  = CGRectMake(pad + half + gap, y, half, 38);
+    y += 44;
+    _btnPick.frame    = CGRectMake(pad, y, half, 38);
+    _btnURL.frame     = CGRectMake(pad + half + gap, y, half, 38);
 }
 
 #pragma mark - 动作
 
-- (BXCaptureBridge *)bridge {
-    return [BXCaptureBridge shared];
-}
+- (BXCaptureBridge *)bridge { return [BXCaptureBridge shared]; }
 
 - (NSString *)savedURL {
     NSString *u = [[BXFloatStore shared] objectForKey:@"bx.rtsp.url"];
@@ -251,7 +324,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
 - (void)sourceTapped:(UIButton *)b {
     if (self.busy) {
-        NSLog(@"[BXFloat][panel] 忙，忽略点击");
+        NSLog(@"[BXFloat][panel] 忙，忽略");
         return;
     }
     NSInteger want = b.tag;
@@ -268,19 +341,36 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         [self stopNetwork];
         self.source = 1;
         [self persist];
-        [self refresh];
-        if (self.bridge.sourcePath.length) {
-            self.bridge.enabled = YES;
-            [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
+        if (!self.bridge.sourcePath.length) {
             [self refresh];
-            // 已有视频时，同时给一次更换入口（点「选择视频」也可以换）
-        } else {
             [self presentPicker];
+            return;
         }
+        self.bridge.enabled = YES;
+        [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
+        [self refresh];
         return;
     }
 
     [self startRTSP];
+}
+
+- (void)tileTapped:(UITapGestureRecognizer *)g {
+    BXCaptureBridge *b = self.bridge;
+    BXFloatStore *st = [BXFloatStore shared];
+
+    if (g.view.tag == 20) {
+        b.mirror = !b.mirror;
+        [st setObject:@(b.mirror) forKey:@"bx.vcam.mirror"];
+    } else if (g.view.tag == 21) {
+        NSInteger r = (b.rotation + 90) % 360;
+        b.rotation = r;
+        [st setObject:@(r / 90) forKey:@"bx.vcam.rotation"];
+    } else if (g.view.tag == 22) {
+        b.audioReplace = !b.audioReplace;
+        [st setObject:@(b.audioReplace) forKey:@"bx.vcam.audio"];
+    }
+    [self refresh];
 }
 
 - (void)startRTSP {
@@ -293,7 +383,6 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
     self.busy = YES;
     [self refresh];
-    NSLog(@"[BXFloat][panel] 开始连流 %@", url);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -310,7 +399,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
             err = [NSError errorWithDomain:@"BX" code:-1
                                   userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"异常"}];
         }
-        NSLog(@"[BXFloat][panel] 连流结果 ok=%d err=%@", (int)ok, err);
+        NSLog(@"[BXFloat][panel] 连流 ok=%d err=%@", (int)ok, err);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) s2 = weakSelf;
@@ -407,13 +496,8 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     [self refresh];
 }
 
-- (void)pickTapped {
-    [self presentPicker];
-}
-
-- (void)urlTapped {
-    [self promptURL];
-}
+- (void)pickTapped { [self presentPicker]; }
+- (void)urlTapped  { [self promptURL]; }
 
 - (void)previewTapped {
     NSString *url = self.bridge.rtspURL.length ? self.bridge.rtspURL : [self savedURL];
@@ -434,6 +518,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
          "已解码：%lu\n"
          "进入造帧：%lu\n"
          "已替换：%lu\n"
+         "音频替换：%lu\n"
          "直通：%lu\n"
          "造帧：%@\n"
          "错误：%@\n"
@@ -447,6 +532,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         (unsigned long)b.decodedFrames,
         (unsigned long)b.attemptFrames,
         (unsigned long)b.replacedFrames,
+        (unsigned long)b.audioReplaced,
         (unsigned long)b.passthroughFrames,
         b.streamFrameReason ?: @"-",
         b.buildError ?: @"-",
@@ -457,7 +543,6 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 }
 
 - (void)closeTapped {
-    // X 只收起面板，不停流。停流请点「关闭」。
     NSLog(@"[BXFloat][panel] X：收起面板（拉流保持）");
 
     SEL sel = NSSelectorFromString(@"_collapseMenu");
@@ -493,9 +578,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         if (pv) {
             id shared = [pv performSelector:NSSelectorFromString(@"shared")];
             SEL hide = NSSelectorFromString(@"hidePreview");
-            if (shared && [shared respondsToSelector:hide]) {
-                [shared performSelector:hide];
-            }
+            if (shared && [shared respondsToSelector:hide]) [shared performSelector:hide];
         }
     } @catch (NSException *e) {
     }
@@ -515,8 +598,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     if (rtsp.length) cur = 2;
     else if (b.enabled && local.length) cur = 1;
 
-    NSArray *arr = @[_btnNone, _btnLocal, _btnRTSP];
-    for (UIButton *x in arr) {
+    for (UIButton *x in @[_btnNone, _btnLocal, _btnRTSP]) {
         BOOL on = (x.tag == cur);
         x.backgroundColor = on ? C_BLUE() : C_CARD();
         [x setTitleColor:(on ? [UIColor whiteColor] : C_TEXT()) forState:UIControlStateNormal];
@@ -545,6 +627,17 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         _statusTitle.text = @"未连接";
         _statusDetail.text = [self savedURL];
     }
+
+    UILabel *vm = [_tileMirror viewWithTag:103];
+    UILabel *vr = [_tileRotate viewWithTag:103];
+    UILabel *va = [_tileAudio viewWithTag:103];
+    vm.text = b.mirror ? @"开启" : @"关闭";
+    vr.text = [NSString stringWithFormat:@"%ld°", (long)b.rotation];
+    va.text = b.audioReplace ? @"视频原声" : @"麦克风";
+
+    _tileMirror.backgroundColor = b.mirror ? C_BLUEBG() : C_CARD();
+    _tileRotate.backgroundColor = (b.rotation != 0) ? C_BLUEBG() : C_CARD();
+    _tileAudio.backgroundColor  = b.audioReplace ? C_BLUEBG() : C_CARD();
 }
 
 - (void)reload {
