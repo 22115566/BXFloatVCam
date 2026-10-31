@@ -37,6 +37,8 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 @property (nonatomic, strong) UILabel *statusIcon;
 @property (nonatomic, strong) UILabel *statusTitle;
 @property (nonatomic, strong) UILabel *statusDetail;
+@property (nonatomic, strong) UIButton *btnAddr;   // 状态条右侧的「地址」快捷入口
+@property (nonatomic, strong) UILabel *footerLabel;
 
 @property (nonatomic, strong) UIButton *btnNone;
 @property (nonatomic, strong) UIButton *btnLocal;
@@ -115,6 +117,13 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     _statusDetail.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [_statusCard addSubview:_statusDetail];
 
+    _btnAddr = [UIButton buttonWithType:UIButtonTypeSystem];
+    _btnAddr.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    [_btnAddr setTitle:@"地址" forState:UIControlStateNormal];
+    [_btnAddr setTitleColor:C_BLUE() forState:UIControlStateNormal];
+    [_btnAddr addTarget:self action:@selector(urlTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_statusCard addSubview:_btnAddr];
+
     _btnNone  = [self sourceButton:@"关闭" sub:@"不替换摄像头" tag:0];
     _btnLocal = [self sourceButton:@"本地视频" sub:@"用相册里的视频替换" tag:1];
     _btnRTSP  = [self sourceButton:@"RTSP 拉流" sub:@"用你自己的流替换" tag:2];
@@ -141,6 +150,13 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     _btnStatus  = [self actionButton:@"运行状态" tag:11];
     _btnPick    = [self actionButton:@"选择视频" tag:12];
     _btnURL     = [self actionButton:@"流地址" tag:13];
+
+    _footerLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _footerLabel.font = [UIFont systemFontOfSize:9];
+    _footerLabel.textColor = C_SUB();
+    _footerLabel.textAlignment = NSTextAlignmentCenter;
+    _footerLabel.text = [NSString stringWithFormat:@"%@ %@ · local 版（无授权）", kBXMenuTitle, kBXVersion];
+    [self.view addSubview:_footerLabel];
 }
 
 - (UIButton *)sourceButton:(NSString *)title sub:(NSString *)sub tag:(NSInteger)tag {
@@ -225,50 +241,54 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
     CGFloat pad = 14;
     CGFloat cw = w - pad * 2;
-    CGFloat y = 12;
+    CGFloat y = 10;
 
-    _titleLabel.frame = CGRectMake(pad, y, cw - 44, 26);
-    _closeButton.frame = CGRectMake(w - pad - 32, y - 2, 32, 32);
-    y += 34;
+    _titleLabel.frame = CGRectMake(pad, y, cw - 44, 24);
+    _closeButton.frame = CGRectMake(w - pad - 30, y - 2, 30, 30);
+    y += 32;
 
-    _statusCard.frame = CGRectMake(pad, y, cw, 46);
-    _statusIcon.frame = CGRectMake(10, 13, 20, 20);
-    _statusTitle.frame = CGRectMake(36, 8, cw - 46, 16);
-    _statusDetail.frame = CGRectMake(36, 24, cw - 46, 14);
-    y += 54;
+    _statusCard.frame = CGRectMake(pad, y, cw, 44);
+    _statusIcon.frame = CGRectMake(10, 12, 20, 20);
+    _statusTitle.frame = CGRectMake(36, 7, cw - 106, 16);
+    _statusDetail.frame = CGRectMake(36, 23, cw - 106, 14);
+    _btnAddr.frame = CGRectMake(cw - 60, 7, 50, 30);
+    y += 52;
 
     for (UIButton *b in @[_btnNone, _btnLocal, _btnRTSP]) {
-        b.frame = CGRectMake(pad, y, cw, 44);
+        b.frame = CGRectMake(pad, y, cw, 42);
         UILabel *sub = [b viewWithTag:99];
-        sub.frame = CGRectMake(12, 24, cw - 24, 12);
-        y += 50;
+        sub.frame = CGRectMake(12, 23, cw - 24, 12);
+        y += 46;
     }
 
-    y += 4;
-    _quickLabel.frame = CGRectMake(pad, y, cw, 14);
-    y += 20;
+    y += 2;
+    _quickLabel.frame = CGRectMake(pad, y, cw, 13);
+    y += 18;
 
     CGFloat gap = 8;
     CGFloat tw = (cw - gap * 2) / 3.0;
     NSArray *tiles = @[_tileMirror, _tileRotate, _tileAudio];
     for (NSInteger i = 0; i < 3; i++) {
         UIView *t = tiles[i];
-        t.frame = CGRectMake(pad + i * (tw + gap), y, tw, 62);
+        t.frame = CGRectMake(pad + i * (tw + gap), y, tw, 58);
         UIImageView *iv = [t viewWithTag:101];
         UILabel *name = [t viewWithTag:102];
         UILabel *val = [t viewWithTag:103];
-        iv.frame = CGRectMake(8, 8, 18, 18);
-        name.frame = CGRectMake(8, 30, tw - 16, 14);
-        val.frame = CGRectMake(8, 44, tw - 16, 12);
+        iv.frame = CGRectMake(8, 7, 16, 16);
+        name.frame = CGRectMake(8, 26, tw - 16, 13);
+        val.frame = CGRectMake(8, 40, tw - 16, 12);
     }
-    y += 68;
+    y += 62;
 
     CGFloat half = (cw - gap) / 2.0;
-    _btnPreview.frame = CGRectMake(pad, y, half, 38);
-    _btnStatus.frame  = CGRectMake(pad + half + gap, y, half, 38);
-    y += 44;
-    _btnPick.frame    = CGRectMake(pad, y, half, 38);
-    _btnURL.frame     = CGRectMake(pad + half + gap, y, half, 38);
+    _btnPreview.frame = CGRectMake(pad, y, half, 36);
+    _btnStatus.frame  = CGRectMake(pad + half + gap, y, half, 36);
+    y += 42;
+    _btnPick.frame    = CGRectMake(pad, y, half, 36);
+    _btnURL.frame     = CGRectMake(pad + half + gap, y, half, 36);
+    y += 42;
+
+    _footerLabel.frame = CGRectMake(pad, y, cw, 14);
 }
 
 #pragma mark - 动作
@@ -615,7 +635,8 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         _statusIcon.text = @"✓";
         _statusIcon.textColor = C_GREEN();
         _statusTitle.text = @"RTSP 已连接";
-        _statusDetail.text = rtsp;
+        _statusDetail.text = [NSString stringWithFormat:@"%@ · 已替换 %lu 帧",
+                              rtsp, (unsigned long)b.replacedFrames];
     } else if (cur == 1 && local.length) {
         _statusIcon.text = @"✓";
         _statusIcon.textColor = C_GREEN();
@@ -625,7 +646,9 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         _statusIcon.text = @"○";
         _statusIcon.textColor = C_SUB();
         _statusTitle.text = @"未连接";
-        _statusDetail.text = [self savedURL];
+        _statusDetail.text = [self savedURL].length
+            ? [self savedURL]
+            : @"先点「地址」填一个 rtsp:// 地址";
     }
 
     UILabel *vm = [_tileMirror viewWithTag:103];
