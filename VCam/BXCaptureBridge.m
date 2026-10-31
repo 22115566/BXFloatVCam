@@ -6,6 +6,7 @@
 #import "BXVideoSource.h"
 #import "BXStreamVideoSource.h"
 #import "BXFFmpegRTSP.h"
+#import "BXLocalAudio.h"
 #import "BXSwizzle.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -121,8 +122,11 @@ static BOOL BXBlitInto(CVPixelBufferRef dst, CVPixelBufferRef src) {
 //  AVCaptureAudioDataOutput 给的是 LPCM（常见 48k / Float32 / 单或双声道），
 //  我们把 RTSP 的音频重采样成 S16/48k/立体声，再按目标格式落进去。
 // ─────────────────────────────────────────────────────────────
-static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
-    if (!sbuf || !src || ![src hasAudio]) return NO;
+static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src, BXLocalAudio *localAudio) {
+    if (!sbuf) return NO;
+    BOOL useRTSP = (src && [src hasAudio]);
+    BOOL useLocal = (!useRTSP && localAudio && [localAudio isLoaded]);
+    if (!useRTSP && !useLocal) return NO;
 
     CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sbuf);
     if (!fd) return NO;
@@ -165,7 +169,9 @@ static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
     int16_t *pcm = (int16_t *)malloc((size_t)frames * outCh * sizeof(int16_t));
     if (!pcm) { CFRelease(block); return NO; }
 
-    NSUInteger got = [src copyAudioS16:pcm maxFrames:frames];
+    NSUInteger got = useRTSP
+        ? [src copyAudioS16:pcm maxFrames:frames]
+        : [localAudio readS16:pcm maxFrames:frames];
     if (got == 0) { free(pcm); CFRelease(block); return NO; }
 
     uint8_t *dstBase = (uint8_t *)abl.mBuffers[0].mData;
@@ -203,6 +209,7 @@ static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
 @property (nonatomic, strong) BXVideoSource *source;
 @property (nonatomic, strong) BXStreamVideoSource *stream;
 @property (nonatomic, strong) BXFFmpegRTSP *rtsp;
+@property (nonatomic, strong) BXLocalAudio *localAudio;
 @property (atomic, assign) BOOL installed;
 @property (atomic, assign) NSUInteger replacedFrames;
 @property (atomic, assign) NSUInteger passthroughFrames;
@@ -227,6 +234,7 @@ static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
         _source = [BXVideoSource new];
         _stream = [BXStreamVideoSource new];
         _rtsp = [BXFFmpegRTSP new];
+        _localAudio = [BXLocalAudio new];
         _enabled = NO;
         _audioReplace = YES;
         _installed = NO;
@@ -254,6 +262,8 @@ static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
 
 - (NSString *)rtspURL { return self.rtsp.urlString; }
 
+- (BOOL)hasOwnAudio { return self.rtsp.hasAudio || self.localAudio.isLoaded; }
+
 - (NSUInteger)decodedFrames { return self.rtsp.decodedFrames; }
 - (NSString *)streamFrameReason { return self.rtsp.lastReason ?: @"-"; }
 
@@ -280,6 +290,12 @@ static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
 
 - (BOOL)useVideoAtPath:(NSString *)path error:(NSError **)error {
     if (!path.length) return NO;
+    // 音轨一起载入：否则本地视频只有画面、声音还是麦克风
+    @try {
+        [self.localAudio loadURL:[NSURL fileURLWithPath:path] error:NULL];
+    } @catch (NSException *e) {
+        NSLog(@"[BXFloat][vcam] 音轨载入异常 %@", e);
+    }
     return [self.source loadURL:[NSURL fileURLWithPath:path] error:error];
 }
 
@@ -412,7 +428,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // 音频：和视频同一套思路，直接写进摄像头 PCM
     if (!isVideo && self.enabled && self.rtsp.isRunning && self.audioReplace) {
         @try {
-            if (BXBlitAudio(sampleBuffer, self.rtsp)) {
+            if (BXBlitAudio(sampleBuffer, self.rtsp, self.localAudio)) {
                 self.audioReplaced += 1;
             }
         } @catch (NSException *e) {
@@ -434,6 +450,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
                 CVPixelBufferRef mine = NULL;
                 if (self.rtsp.isRunning) {
+                    // 按摄像头真实格式/尺寸对齐解码输出（420f vs 420v 影响色阶）
+                    [self.rtsp prepareForCameraFormat:camFmt
+                                                width:(size_t)target.width
+                                               height:(size_t)target.height];
                     self.rtsp.targetFormat = camFmt;
                     // 音画同步：用「摄像头这一帧的 PTS」去挑一帧解码结果，
                     // 而不是盲取最新帧。百相就是这么对齐的。
