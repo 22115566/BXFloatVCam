@@ -38,6 +38,7 @@
     uint8_t         *_bgra;        // 转换缓冲（按需重分配，绝不沿用启动时的尺寸）
     size_t          _bgraSize;
     BOOL            _loopActive;   // 解码线程是否在跑（决定由谁负责释放 ffmpeg 上下文）
+    NSString       *_lastReason;   // 上次取帧失败原因（排查用）
 }
 @property (atomic, assign) BOOL running;
 @property (atomic, copy)   NSString *urlString;
@@ -167,14 +168,26 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
 - (void)decodeLoop {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    NSString *url = self.urlString;
+    int reconnect = 0;
 
+read_again:
     while (!_stopRequested && _fmt && pkt && frame) {
         int ret = av_read_frame(_fmt, pkt);
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN)) { usleep(2000); continue; }
-            NSLog(@"[BXRTSP] 读帧结束/出错 %d", ret);
-            break;
+            NSLog(@"[BXRTSP] 读帧结束/出错 %d，准备重连（第 %d 次）", ret, reconnect);
+            // 断线自动重连：服务端踢掉旧连接、网络抖动都很常见，
+            // 不重连的话画面会永远停在最后一帧（或一直直通真实摄像头）。
+            if (_stopRequested || !url.length || reconnect >= 30) break;
+            reconnect++;
+            usleep(800 * 1000);
+            if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+            if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
+            if (![self reopenForReconnect:url]) break;
+            continue;
         }
+        reconnect = 0;
         if (pkt->stream_index != _streamIndex) { av_packet_unref(pkt); continue; }
 
         if (avcodec_send_packet(_dec, pkt) == 0) {
@@ -260,10 +273,16 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
 
 #pragma mark - 取帧
 
+- (NSString *)lastReason { return _lastReason ?: @"-"; }
+
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED {
     [_lock lock];
 
-    if (!_latest) { [_lock unlock]; return NULL; }
+    if (!_latest) {
+        _lastReason = self.running ? @"解码还没出帧" : @"未连接";
+        [_lock unlock];
+        return NULL;
+    }
     CVPixelBufferRef src = CVPixelBufferRetain(_latest);
 
     BOOL needRotate = (_rotation % 360) != 0;
@@ -298,6 +317,7 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
     if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
     if (outSize.width < 2 || outSize.height < 2) {
+        _lastReason = [NSString stringWithFormat:@"目标尺寸异常 %.0fx%.0f", outSize.width, outSize.height];
         CVPixelBufferRelease(src);
         [_lock unlock];
         return NULL;
@@ -316,10 +336,15 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     }
 
     CVPixelBufferRef dst = NULL;
-    if (_pool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) == kCVReturnSuccess && dst) {
+    if (!_pool) {
+        _lastReason = @"像素池创建失败";
+    } else if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) != kCVReturnSuccess || !dst) {
+        _lastReason = @"像素池取缓冲失败";
+    } else {
         [_ci render:img toCVPixelBuffer:dst
                bounds:CGRectMake(0, 0, outSize.width, outSize.height)
-           colorSpace:CGColorSpaceCreateDeviceRGB()];
+          colorSpace:CGColorSpaceCreateDeviceRGB()];
+        _lastReason = @"ok";
     }
     CVPixelBufferRelease(src);
     [_lock unlock];
