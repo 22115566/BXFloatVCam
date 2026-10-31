@@ -376,10 +376,9 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 }
 
 - (void)closeTapped {
-    NSLog(@"[BXFloat][panel] 关闭：全部停止");
-    [self stopEverything];
-    self.source = 0;
-    [self persistAndRefresh];
+    // X 只负责收起面板，不停流。
+    // 要停流请点「关闭」按钮 —— 两者职责分开，避免误触把正在跑的拉流停掉。
+    NSLog(@"[BXFloat][panel] X：收起面板（拉流保持）");
 
     SEL sel = NSSelectorFromString(@"_collapseMenu");
     Class wc = NSClassFromString(@"BXFloatWindow");
