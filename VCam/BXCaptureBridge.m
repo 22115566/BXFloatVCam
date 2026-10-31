@@ -9,7 +9,6 @@
 #import "BXSwizzle.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <CoreImage/CoreImage.h>
 
 static const void *kBXOrigDelegateKey = &kBXOrigDelegateKey;
 static const void *kBXOrigQueueKey    = &kBXOrigQueueKey;
@@ -67,6 +66,7 @@ static CVPixelBufferRef BXConvertPixelBuffer(CVPixelBufferRef src, OSType dstFmt
 @property (atomic, assign) NSUInteger capturedOutputs;
 @property (nonatomic, assign) NSUInteger attemptFrames;
 @property (nonatomic, copy) NSString *gateReason;
+@property (nonatomic, copy) NSString *buildError;
 @end
 
 @implementation BXCaptureBridge
@@ -351,6 +351,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     if (converted) {
         CVPixelBufferRelease(frame);
         frame = converted;
+        self.buildError = [NSString stringWithFormat:@"转换ok %c%c%c%c",
+                           (char)(camPixelFmt >> 24), (char)(camPixelFmt >> 16),
+                           (char)(camPixelFmt >> 8), (char)camPixelFmt];
+    } else {
+        self.buildError = @"像素格式转换失败";
+        NSLog(@"[BXFloat][vcam] 像素格式转换失败 camFmt=%08x", (unsigned)camPixelFmt);
     }
 
     if (!frame) {
@@ -404,6 +410,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     } else {
         OSStatus fe = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
         if (fe != noErr || !fmt) {
+            self.buildError = [NSString stringWithFormat:@"建fmt失败 st=%d", (int)fe];
             NSLog(@"[BXFloat][vcam] 建 format description 失败 %d", (int)fe);
             CVPixelBufferRelease(frame);
             return NULL;
@@ -430,6 +437,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     CVPixelBufferRelease(frame);
     if (st != noErr || !out) {
         static int logCount = 0;
+        self.buildError = [NSString stringWithFormat:@"建buffer失败 st=%d %zux%zu",
+                           (int)st, fw, fh];
         if (logCount < 5) {
             logCount++;
             NSLog(@"[BXFloat][vcam] CMSampleBufferCreateReadyWithImageBuffer 失败 st=%d fmt=%c%c%c%c %zux%zu",
@@ -448,6 +457,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         CFRelease(atts);
     }
 
+    self.buildError = @"成功";
     return out;
 }
 
