@@ -1,13 +1,13 @@
 //
-//  BXFloatMenuController.m —— 极简稳定版
+//  BXFloatMenuController.m —— 极简稳定版（重写）
 //
-//  设计原则（针对前几版崩溃的教训）：
-//    1. 不用 UISwitch：开关状态回写一旦被 reload 打断就容易失效，
-//       改成三个大按钮 —— 点一下就是一次明确动作，状态只用于显示。
-//    2. 不用 UIScrollView + 动态重建：面板尺寸由悬浮窗决定（约 300x430），
-//       在 viewDidLayoutSubviews 里按当前尺寸摆位，绝不重建子视图。
-//    3. 弹窗统一从悬浮窗的 rootViewController 出，全部 @try 包住。
-//    4. 耗时动作（连流、选片）一律后台执行，主线程只改 UI。
+//  原则：
+//    1. 不用 UISwitch / UIScrollView，避免状态回写与重建导致的崩溃。
+//    2. 布局只在 viewDidLayoutSubviews 里算 frame，不重建视图。
+//    3. 弹窗统一从悬浮窗 rootViewController 出，全部 @try。
+//    4. 连流等耗时动作一律后台队列，主线程只改 UI。
+//    5. 状态面板显示 启用 / 已解码 / 进入造帧 / 已替换 / 直通 / 造帧 / 错误 / 判定，
+//       排查不用再看日志。
 //
 
 #import "BXFloatMenuController.h"
@@ -15,8 +15,6 @@
 #import "BXCaptureBridge.h"
 #import "BXPreviewWindow.h"
 #import "BXConfig.h"
-
-#pragma mark - 配色（函数式，调用必须带括号）
 
 static UIColor *C_BG(void)     { return [UIColor whiteColor]; }
 static UIColor *C_TEXT(void)   { return [UIColor colorWithRed:0.11 green:0.11 blue:0.12 alpha:1]; }
@@ -26,7 +24,8 @@ static UIColor *C_BLUE(void)   { return [UIColor colorWithRed:0.18 green:0.48 bl
 static UIColor *C_BLUEBG(void) { return [UIColor colorWithRed:0.90 green:0.94 blue:1.00 alpha:1]; }
 static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 blue:0.42 alpha:1]; }
 
-@interface BXFloatMenuController ()
+@interface BXFloatMenuController () <UIDocumentPickerDelegate>
+
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIButton *closeButton;
 
@@ -43,9 +42,12 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
 @property (nonatomic, assign) NSInteger source;   // 0 关闭 / 1 本地 / 2 RTSP
 @property (nonatomic, assign) BOOL busy;
+
 @end
 
 @implementation BXFloatMenuController
+
+#pragma mark - 生命周期
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -55,13 +57,16 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     self.view.backgroundColor = C_BG();
     self.view.layer.cornerRadius = 18;
     self.view.layer.masksToBounds = YES;
+
     [self buildUI];
     [self refresh];
 }
 
-- (CGFloat)W { return self.view.bounds.size.width; }
+- (CGFloat)W {
+    return self.view.bounds.size.width;
+}
 
-#pragma mark - 建 UI（只建一次）
+#pragma mark - 建 UI
 
 - (void)buildUI {
     _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
@@ -146,7 +151,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     return b;
 }
 
-#pragma mark - 摆位
+#pragma mark - 布局
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
@@ -182,7 +187,9 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
 #pragma mark - 动作
 
-- (BXCaptureBridge *)bridge { return [BXCaptureBridge shared]; }
+- (BXCaptureBridge *)bridge {
+    return [BXCaptureBridge shared];
+}
 
 - (NSString *)savedURL {
     NSString *u = [[BXFloatStore shared] objectForKey:@"bx.rtsp.url"];
@@ -215,30 +222,42 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 - (void)alert:(NSString *)title message:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *host = [self hostVC];
-        if (!host) { NSLog(@"[BXFloat][panel] 无 presenter: %@ %@", title, msg); return; }
+        if (!host) {
+            NSLog(@"[BXFloat][panel] 无 presenter: %@ %@", title, msg);
+            return;
+        }
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                    message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-        @try { [host presentViewController:ac animated:YES completion:nil]; }
-        @catch (NSException *e) { NSLog(@"[BXFloat][panel] 弹窗异常 %@", e); }
+        @try {
+            [host presentViewController:ac animated:YES completion:nil];
+        } @catch (NSException *e) {
+            NSLog(@"[BXFloat][panel] 弹窗异常 %@", e);
+        }
     });
 }
 
 - (void)sourceTapped:(UIButton *)b {
-    if (self.busy) { NSLog(@"[BXFloat][panel] 忙，忽略点击"); return; }
+    if (self.busy) {
+        NSLog(@"[BXFloat][panel] 忙，忽略点击");
+        return;
+    }
     NSInteger want = b.tag;
 
     if (want == 0) {
         [self stopEverything];
         self.source = 0;
-        [self persistAndRefresh];
+        [self persist];
+        [self refresh];
         return;
     }
+
     if (want == 1) {
         [self stopNetwork];
         self.source = 1;
-        [self persistAndRefresh];
+        [self persist];
+        [self refresh];
         if (self.bridge.sourcePath.length) {
             self.bridge.enabled = YES;
             [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
@@ -248,13 +267,17 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         }
         return;
     }
+
     [self startRTSP];
 }
 
 - (void)startRTSP {
     if (self.busy) return;
     NSString *url = [self savedURL];
-    if (!url.length) { [self promptURL]; return; }
+    if (!url.length) {
+        [self promptURL];
+        return;
+    }
 
     self.busy = YES;
     [self refresh];
@@ -292,14 +315,18 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
                 [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
                 [s2 alert:@"连接失败" message:err.localizedDescription ?: @"无法连接该地址"];
             }
-            [s2 persistAndRefresh];
+            [s2 persist];
+            [s2 refresh];
         });
     });
 }
 
 - (void)promptURL {
     UIViewController *host = [self hostVC];
-    if (!host) { [self alert:@"打不开输入框" message:@"没有可用的控制器"]; return; }
+    if (!host) {
+        [self alert:@"打不开输入框" message:@"没有可用的控制器"];
+        return;
+    }
 
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"流地址"
@@ -314,6 +341,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
     }];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
     __weak typeof(self) weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"保存并连接" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *a) {
@@ -323,20 +351,30 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         [[BXFloatStore shared] setObject:u forKey:@"bx.rtsp.url"];
         [weakSelf startRTSP];
     }]];
-    @try { [host presentViewController:ac animated:YES completion:nil]; }
-    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 输入框异常 %@", e); }
+
+    @try {
+        [host presentViewController:ac animated:YES completion:nil];
+    } @catch (NSException *e) {
+        NSLog(@"[BXFloat][panel] 输入框异常 %@", e);
+    }
 }
 
 - (void)presentPicker {
     UIViewController *host = [self hostVC];
-    if (!host) { [self alert:@"无法选片" message:@"没有可用的控制器"]; return; }
+    if (!host) {
+        [self alert:@"无法选片" message:@"没有可用的控制器"];
+        return;
+    }
     UIDocumentPickerViewController *p =
         [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.movie"]
                                                              inMode:UIDocumentPickerModeImport];
-    p.delegate = (id<UIDocumentPickerDelegate>)self;
+    p.delegate = self;
     p.allowsMultipleSelection = NO;
-    @try { [host presentViewController:p animated:YES completion:nil]; }
-    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 选择器异常 %@", e); }
+    @try {
+        [host presentViewController:p animated:YES completion:nil];
+    } @catch (NSException *e) {
+        NSLog(@"[BXFloat][panel] 选择器异常 %@", e);
+    }
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
@@ -359,14 +397,30 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 
 - (void)previewTapped {
     NSString *url = self.bridge.rtspURL.length ? self.bridge.rtspURL : [self savedURL];
-    @try { [[BXPreviewWindow shared] showWithURL:url]; }
-    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 预览异常 %@", e); }
+    @try {
+        [[BXPreviewWindow shared] showWithURL:url];
+    } @catch (NSException *e) {
+        NSLog(@"[BXFloat][panel] 预览异常 %@", e);
+    }
 }
 
 - (void)statusTapped {
     BXCaptureBridge *b = self.bridge;
-    NSString *msg = [NSString stringWithFormat:
-        @"hook：%@\n启用：%@\n接管采集：%lu\n已解码：%lu\n进入造帧：%lu\n已替换：%lu\n直通：%lu\n造帧：%@\n错误：%@\n判定：%@\n来源：%@",
+
+    NSString *fmt =
+        @"hook：%@\n"
+         "启用：%@\n"
+         "接管采集：%lu\n"
+         "已解码：%lu\n"
+         "进入造帧：%lu\n"
+         "已替换：%lu\n"
+         "直通：%lu\n"
+         "造帧：%@\n"
+         "错误：%@\n"
+         "判定：%@\n"
+         "来源：%@";
+
+    NSString *msg = [NSString stringWithFormat:fmt,
         b.installed ? @"已装" : @"未装",
         b.enabled ? @"是" : @"否",
         (unsigned long)b.capturedOutputs,
@@ -374,16 +428,16 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         (unsigned long)b.attemptFrames,
         (unsigned long)b.replacedFrames,
         (unsigned long)b.passthroughFrames,
-        b.streamFrameReason,
+        b.streamFrameReason ?: @"-",
         b.buildError ?: @"-",
         b.gateReason ?: @"-",
         b.rtspURL.length ? b.rtspURL : (b.sourcePath ?: @"无")];
+
     [self alert:@"运行状态" message:msg];
 }
 
 - (void)closeTapped {
-    // X 只负责收起面板，不停流。
-    // 要停流请点「关闭」按钮 —— 两者职责分开，避免误触把正在跑的拉流停掉。
+    // X 只收起面板，不停流。停流请点「关闭」。
     NSLog(@"[BXFloat][panel] X：收起面板（拉流保持）");
 
     SEL sel = NSSelectorFromString(@"_collapseMenu");
@@ -401,7 +455,11 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 #pragma mark - 状态
 
 - (void)stopNetwork {
-    @try { [self.bridge stopNetworkSources]; } @catch (NSException *e) {}
+    @try {
+        [self.bridge stopNetworkSources];
+    } @catch (NSException *e) {
+        NSLog(@"[BXFloat][panel] 停网络异常 %@", e);
+    }
 }
 
 - (void)stopEverything {
@@ -409,24 +467,23 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     self.bridge.enabled = NO;
     [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.vcam.enabled"];
     [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
+
     @try {
         Class pv = NSClassFromString(@"BXPreviewWindow");
         if (pv) {
             id shared = [pv performSelector:NSSelectorFromString(@"shared")];
             SEL hide = NSSelectorFromString(@"hidePreview");
-            if (shared && [shared respondsToSelector:hide]) [shared performSelector:hide];
+            if (shared && [shared respondsToSelector:hide]) {
+                [shared performSelector:hide];
+            }
         }
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+    }
 }
 
 - (void)persist {
     NSString *v = (self.source == 2) ? @"rtsp" : (self.source == 1 ? @"local" : @"none");
     [[BXFloatStore shared] setObject:v forKey:@"bx.vcam.source"];
-}
-
-- (void)persistAndRefresh {
-    [self persist];
-    [self refresh];
 }
 
 - (void)refresh {
