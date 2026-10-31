@@ -68,6 +68,15 @@ static id   BXGetSampleBufferDelegate(id self, SEL _cmd);
 
 - (NSString *)rtspURL { return self.rtsp.urlString; }
 
+- (NSUInteger)decodedFrames { return self.rtsp.decodedFrames; }
+- (NSString *)streamFrameReason { return self.rtsp.lastReason ?: @"-"; }
+
+- (CVPixelBufferRef)copyLatestStreamFrame CF_RETURNS_RETAINED {
+    if (self.rtsp.isRunning) return [self.rtsp copyNextFrameScaledTo:CGSizeZero];
+    if (self.stream.isRunning) return [self.stream copyNextFrameScaledTo:CGSizeZero];
+    return NULL;
+}
+
 - (void)stopNetworkSources {
     [self.rtsp stop];
     [self.stream stop];
