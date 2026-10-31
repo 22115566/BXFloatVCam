@@ -244,12 +244,21 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 有系统弹窗 / 文件选择器时全放行：
+    // 它们居中弹出，落在 bubble/menu 区域之外，否则触摸会被穿透给宿主 App，
+    // 表现就是「弹窗出来了但点不动」。
+    if (self.allowAllTouches) {
+        UIView *v = [super hitTest:point withEvent:event];
+        if (v) return v;
+    }
     UIView *v = [super hitTest:point withEvent:event];
     if (v == self || v == self.rootViewController.view) return nil;   // 空白处穿透给游戏
     return v;
 }
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    // 弹窗期间整块都算我们的，保证弹窗可点
+    if (self.allowAllTouches) return YES;
     // 只有球和展开的面板算"我的地盘"
     if (_bubble && !_bubble.hidden && CGRectContainsPoint(_bubble.frame, point)) return YES;
     if (_menu && _menu.view.superview && !_menu.view.hidden &&
