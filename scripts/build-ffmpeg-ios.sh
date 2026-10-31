@@ -35,7 +35,7 @@ echo "==> configure (arm64, iphoneos, minimal)"
   --enable-cross-compile \
   --disable-everything \
   --disable-programs --disable-doc --disable-avdevice --disable-avfilter \
-  --disable-swresample --disable-postproc --disable-debug --disable-stripping \
+  --enable-swresample --disable-postproc --disable-debug --disable-stripping \
   --disable-autodetect --disable-iconv --disable-zlib --disable-bzlib --disable-lzma \
   --enable-network \
   --enable-protocol=file,http,https,tcp,udp,rtp,rtsp \
