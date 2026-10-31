@@ -14,6 +14,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: vendor/ffmpeg-ios
+          key: ffmpeg-ios-v1
+
       - name: Select Xcode
         run: |
           set -euo pipefail
@@ -46,6 +53,7 @@ jobs:
           which ldid || echo "ldid not found"
 
       - name: Build FFmpeg (arm64 iOS)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           chmod +x scripts/build-ffmpeg-ios.sh
