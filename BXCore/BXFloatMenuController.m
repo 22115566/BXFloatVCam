@@ -44,6 +44,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
 @property (nonatomic, strong) UISwitch *swLocal;
 @property (nonatomic, strong) UISwitch *swRTSP;
 @property (nonatomic, assign) BOOL updatingUI;
+@property (nonatomic, assign) uint64_t connectToken;
 @property (nonatomic, assign) BXSourceKind source;
 
 @property (nonatomic, strong) UIButton *primary;
@@ -366,9 +367,33 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
 }
 
 - (UIViewController *)topMost {
-    UIViewController *top = self;
-    while (top.presentedViewController) top = top.presentedViewController;
-    return top;
+    // 关键：本面板只是被塞进悬浮窗的子视图，不是被 present 出来的控制器。
+    // 从它身上调 presentViewController: 在 iOS 13+ 会抛
+    // "whose view is not in the window hierarchy" —— 表现就是选择器闪退、弹窗没反应。
+    // 所以统一从悬浮窗的 rootViewController 出弹窗。
+    UIViewController *vc = nil;
+
+    Class wc = NSClassFromString(@"BXFloatWindow");
+    if (wc && [wc respondsToSelector:NSSelectorFromString(@"shared")]) {
+        id win = [wc performSelector:NSSelectorFromString(@"shared")];
+        if ([win isKindOfClass:[UIWindow class]]) {
+            vc = [(UIWindow *)win rootViewController];
+        }
+    }
+
+    if (!vc) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w.isKeyWindow) { vc = w.rootViewController; break; }
+            }
+            if (vc) break;
+        }
+    }
+
+    if (!vc) return nil;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
 }
 
 - (void)closeTapped {
@@ -413,6 +438,16 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
     NSInteger k = sw.tag;
     BXSourceKind want = (k == 2) ? BXSourceRTSP : (k == 1 ? BXSourceLocal : BXSourceNone);
 
+    // 连接中：只允许「关闭」，其余忽略（防止两路互相打）
+    if (self.connecting && want != BXSourceNone) {
+        self.updatingUI = NO;
+        [self reload];
+        return;
+    }
+    if (self.connecting && want == BXSourceNone) {
+        self.connecting = NO;      // 手动中止
+    }
+
     // 用户把当前已开的那个关掉 -> 视为「关闭」
     if (!sw.isOn && want == self.source) {
         want = BXSourceNone;
@@ -439,7 +474,6 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
 
         case BXSourceRTSP:
             [self stopNetwork];              // 先断开别的源
-            self.bridge.sourcePath.length ? (void)0 : (void)0;
             [self startRTSP];                // 异步连流，成功后自己切状态
             break;
     }
@@ -477,6 +511,22 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
     self.connecting = YES;
     [self reload];
 
+    // 看门狗：20 秒还没结果就强制复位，避免界面永远停在「连接中…」
+    __weak typeof(self) wdSelf = self;
+    uint64_t token = ++self.connectToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(wdSelf) wd = wdSelf;
+        if (!wd) return;
+        if (wd.connectToken != token) return;          // 已经成功/失败过
+        if (!wd.connecting) return;
+        wd.connecting = NO;
+        wd.source = BXSourceNone;
+        [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
+        NSLog(@"[BXFloat][panel] 连接超时（20s），已复位");
+        [wd reload];
+    });
+
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         __strong typeof(weakSelf) s = weakSelf;
@@ -497,6 +547,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
             __strong typeof(weakSelf) s2 = weakSelf;
             if (!s2) return;
             s2.connecting = NO;
+            s2.connectToken++;
 
             if (ok) {
                 s2.bridge.enabled = YES;
@@ -515,7 +566,11 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
                 [ac addAction:[UIAlertAction actionWithTitle:@"好"
                                                       style:UIAlertActionStyleCancel
                                                     handler:nil]];
-                [[s2 topMost] presentViewController:ac animated:YES completion:nil];
+                UIViewController *host = [s2 topMost];
+                if (host) {
+                    @try { [host presentViewController:ac animated:YES completion:nil]; }
+                    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
+                }
             }
             [s2 persistSource];
             [s2 reload];
@@ -567,7 +622,10 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         [[BXFloatStore shared] setObject:u forKey:@"bx.rtsp.url"];
         [weakSelf startRTSP];
     }]];
-    [[self topMost] presentViewController:ac animated:YES completion:nil];
+    UIViewController *host = [self topMost];
+    if (!host) { NSLog(@"[BXFloat][panel] 没有可用的 presenter"); return; }
+    @try { [host presentViewController:ac animated:YES completion:nil]; }
+    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
 }
 
 - (void)presentPicker {
@@ -575,7 +633,10 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
                                                                    inMode:UIDocumentPickerModeImport];
     _picker.delegate = self;
     _picker.allowsMultipleSelection = NO;
-    [[self topMost] presentViewController:_picker animated:YES completion:nil];
+    UIViewController *host = [self topMost];
+    if (!host) { NSLog(@"[BXFloat][panel] 没有 presenter，无法选片"); return; }
+    @try { [host presentViewController:_picker animated:YES completion:nil]; }
+    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 选择器失败 %@", ex); }
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
@@ -627,7 +688,10 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-            [[self topMost] presentViewController:ac animated:YES completion:nil];
+            UIViewController *host = [self topMost];
+    if (!host) { NSLog(@"[BXFloat][panel] 没有可用的 presenter"); return; }
+    @try { [host presentViewController:ac animated:YES completion:nil]; }
+    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
             return;
         }
         default:
@@ -651,9 +715,10 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         if (self.swNone)  [self.swNone setOn:(cur == BXSourceNone) animated:YES];
         if (self.swLocal) [self.swLocal setOn:(cur == BXSourceLocal) animated:YES];
         if (self.swRTSP)  [self.swRTSP setOn:(cur == BXSourceRTSP) animated:YES];
-        self.swNone.enabled = !self.connecting;
-        self.swLocal.enabled = !self.connecting;
-        self.swRTSP.enabled = !self.connecting;
+        // 三个开关永远可点：连接卡住时用户至少能点「关闭」把它停掉
+        self.swNone.enabled = YES;
+        self.swLocal.enabled = YES;
+        self.swRTSP.enabled = YES;
         self.updatingUI = NO;
     }
 
