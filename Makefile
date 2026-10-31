@@ -30,7 +30,7 @@ BXFloatVCam_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore CoreImage \
 FFMPEG_ROOT = $(THEOS_PROJECT_DIR)/vendor/ffmpeg-ios
 BXFloatVCam_CFLAGS += -I$(FFMPEG_ROOT)/include
 BXFloatVCam_LDFLAGS = -install_name @executable_path/BXFloatVCam.dylib \
-                      -L$(FFMPEG_ROOT)/lib -lavformat -lavcodec -lswscale -lavutil \
+                      -L$(FFMPEG_ROOT)/lib -lavformat -lavcodec -lswscale -lswresample -lavutil \
                       -framework VideoToolbox -framework Security -framework CoreMedia \
                       -framework CoreVideo -framework AudioToolbox
 
