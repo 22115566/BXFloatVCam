@@ -120,10 +120,22 @@ static void BXFloatVCamInit(void) {
             NSLog(@"[BXFloat][vcam] hook 异常: %@", e);
         }
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+        // 反复尝试挂载：某些场景（冷启动、切后台回来）第一秒拿不到 windowScene，
+        // 只试一次就会「插件不见了」。这里持续重试，直到挂上为止。
+        __block int tries = 0;
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                         dispatch_get_main_queue());
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  (uint64_t)(1.5 * NSEC_PER_SEC), 0);
+        dispatch_source_set_event_handler(timer, ^{
+            tries++;
             UIApplication *app = [UIApplication sharedApplication];
-            if (app.applicationState == UIApplicationStateActive) BXAttachIfNeeded();
+            BOOL active = (app.applicationState == UIApplicationStateActive);
+            if (active && BXShouldAttach()) {
+                [[BXFloatWindow shared] attach];
+            }
+            if (tries >= 40) dispatch_source_cancel(timer);   // 60 秒后放弃
         });
+        dispatch_resume(timer);
     }
 }
