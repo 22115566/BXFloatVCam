@@ -12,6 +12,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreImage/CoreImage.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
