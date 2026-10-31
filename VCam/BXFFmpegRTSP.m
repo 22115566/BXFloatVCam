@@ -56,6 +56,8 @@ static NSString *BXFFErr(int code) {
     AVCodecContext *_aDec;
     struct SwrContext *_swr;
     int16_t        *_aRing;
+    int16_t        *_aTmp;        // 复用缓冲，避免每帧 malloc
+    size_t          _aTmpCap;
     size_t          _aRingFrames;
     size_t          _aFillFrames;
     // 音画同步用的解码帧队列（保留最近若干帧 + 各自 PTS）
@@ -64,6 +66,8 @@ static NSString *BXFFErr(int code) {
     int              _qHead;
     int              _qCount;
 
+    OSType          _camFmt;      // 摄像头像素格式
+    size_t          _camW, _camH; // 摄像头尺寸
     int             _aOutRate;
     int             _aOutCh;
 }
@@ -365,10 +369,41 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
     }
     _vtFmt = desc;
 
+    // 输出格式/尺寸由 recreateVTSession 按摄像头实际参数决定
+    [self recreateVTSession];
+}
+
+
+// 按摄像头实际格式重建 VT 输出：420f(全范围) / 420v(视频范围) 选错会有色阶偏差。
+// 摄像头第一次给帧时调用一次即可。
+- (void)prepareForCameraFormat:(OSType)fmt width:(size_t)w height:(size_t)h {
+    if (fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        return;   // 只处理两种常见 YUV
+    }
+    if (_camFmt == fmt && _camW == w && _camH == h) return;
+
+    _camFmt = fmt;
+    _camW = w;
+    _camH = h;
+
+    if (!_vtFmt) return;     // 还没解析出 SPS/PPS，等 setupVideoToolbox 时用新值
+    [self recreateVTSession];
+}
+
+- (void)recreateVTSession {
+    if (_vtSession) {
+        VTDecompressionSessionWaitForAsynchronousFrames(_vtSession);
+        VTDecompressionSessionInvalidate(_vtSession);
+        CFRelease(_vtSession);
+        _vtSession = NULL;
+    }
+    if (!_vtFmt) return;
+
     NSDictionary *dstAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-        (id)kCVPixelBufferWidthKey: @(_srcW > 0 ? _srcW : 720),
-        (id)kCVPixelBufferHeightKey: @(_srcH > 0 ? _srcH : 1280),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(_camFmt ? _camFmt : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        (id)kCVPixelBufferWidthKey: @(_camW ? _camW : (_srcW > 0 ? _srcW : 720)),
+        (id)kCVPixelBufferHeightKey: @(_camH ? _camH : (_srcH > 0 ? _srcH : 1280)),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
 
@@ -376,15 +411,17 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
     cb.decompressionOutputCallback = bx_vt_output;
     cb.decompressionOutputRefCon = (__bridge void *)self;
 
-    OSStatus cs = VTDecompressionSessionCreate(kCFAllocatorDefault, desc, NULL,
+    OSStatus cs = VTDecompressionSessionCreate(kCFAllocatorDefault, _vtFmt, NULL,
                                                (__bridge CFDictionaryRef)dstAttrs, &cb, &_vtSession);
     if (cs != noErr || !_vtSession) {
-        NSLog(@"[BXRTSP] VT 会话创建失败 st=%d", (int)cs);
-        if (_vtFmt) { CFRelease(_vtFmt); _vtFmt = NULL; }
+        NSLog(@"[BXRTSP] VT 重建失败 st=%d", (int)cs);
         _vtSession = NULL;
     } else {
         VTSessionSetProperty(_vtSession, kVTDecompressionPropertyKey_RealTime,
                              (__bridge CFTypeRef)@YES);
+        NSLog(@"[BXRTSP] VT 输出格式对齐摄像头 %c%c%c%c %zux%zu",
+              (char)(_camFmt >> 24), (char)(_camFmt >> 16), (char)(_camFmt >> 8), (char)_camFmt,
+              (size_t)_camW, (size_t)_camH);
     }
 }
 
@@ -451,6 +488,7 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
         if (_aDec) { avcodec_free_context(&_aDec); _aDec = NULL; }
         if (_swr) { swr_free(&_swr); _swr = NULL; }
         if (_aRing) { free(_aRing); _aRing = NULL; }
+        if (_aTmp) { free(_aTmp); _aTmp = NULL; _aTmpCap = 0; }
         _aFillFrames = 0;
         if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
         _loopActive = NO;
@@ -618,6 +656,50 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
 }
 
 // 缩放 / 镜像 / 旋转（不含加锁，调用方负责持有 src）
+// 像素池缓存：每帧新建池是卡顿的主因（30fps × 创建/销毁）
+- (CVPixelBufferPoolRef)poolForSize:(CGSize)size format:(OSType)fmt {
+    static CVPixelBufferPoolRef sPool = NULL;
+    static CGSize sSize = {0, 0};
+    static OSType sFmt = 0;
+
+    if (sPool && CGSizeEqualToSize(sSize, size) && sFmt == fmt) return sPool;
+
+    @synchronized (self) {
+        if (sPool) { CVPixelBufferPoolRelease(sPool); sPool = NULL; }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+            (id)kCVPixelBufferWidthKey: @(size.width),
+            (id)kCVPixelBufferHeightKey: @(size.height),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &sPool);
+        sSize = size;
+        sFmt = fmt;
+        return sPool;
+    }
+}
+
+// 硬件缩放（百相用的就是 VTPixelTransferSession）
+// 注意：流通常是 1280x720 横向、摄像头是 720x1280 竖向，
+// 直接拉伸会把人压扁，所以开启 letterbox（等比缩放 + 黑边）。
+- (BOOL)transferFrom:(CVPixelBufferRef)src to:(CVPixelBufferRef)dst {
+    static VTPixelTransferSessionRef sTransfer = NULL;
+    if (!sTransfer) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &sTransfer) != noErr || !sTransfer) {
+            return NO;
+        }
+        // 照抄百相：导入表里就是这两个常量
+        //   _kVTPixelTransferPropertyKey_ScalingMode
+        //   _kVTScalingMode_CropSourceToCleanAperture
+        // 即「裁剪填充」：等比放大到铺满、多余部分裁掉，不变形、无黑边。
+        VTSessionSetProperty(sTransfer,
+                             kVTPixelTransferPropertyKey_ScalingMode,
+                             kVTScalingMode_CropSourceToCleanAperture);
+    }
+    return VTPixelTransferSessionTransferImage(sTransfer, src, dst) == noErr;
+}
+
+// 缩放 / 镜像 / 旋转（不含加锁，调用方负责持有 src）
 - (CVPixelBufferRef)transformBuffer:(CVPixelBufferRef)src
                              toSize:(CGSize)targetSize CF_RETURNS_RETAINED {
     if (!src) return NULL;
@@ -629,8 +711,39 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
     BOOL needScale = !CGSizeEqualToSize(targetSize, CGSizeZero) &&
                      (fabs(targetSize.width - sw) > 1.0 || fabs(targetSize.height - sh) > 1.0);
 
+    // 尺寸/方向都一样：零拷贝直接返回
     if (!needRotate && !needMirror && !needScale) {
         return (CVPixelBufferRef)CFRetain(src);
+    }
+
+    OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
+    CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
+    if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
+    if (outSize.width < 2 || outSize.height < 2) return NULL;
+
+    CFTimeInterval t0 = CACurrentMediaTime();
+
+    CVPixelBufferPoolRef pool = [self poolForSize:outSize format:pf];
+    if (!pool) return NULL;
+
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) != kCVReturnSuccess || !dst) {
+        return NULL;
+    }
+
+    // 只需要缩放、且两边都是 420f：走硬件通道，不碰 CIContext
+    OSType srcFmt = CVPixelBufferGetPixelFormatType(src);
+    if (needScale && !needRotate && !needMirror &&
+        srcFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        if ([self transferFrom:src to:dst]) {
+            double ms = (CACurrentMediaTime() - t0) * 1000.0;
+            [_lock lock];
+            _lastReason = [NSString stringWithFormat:@"硬缩放ok %.1fms %0.fx%.0f→%.0fx%.0f",
+                           ms, sw, sh, outSize.width, outSize.height];
+            [_lock unlock];
+            return dst;
+        }
     }
 
     CIImage *img = [CIImage imageWithCVPixelBuffer:src];
@@ -649,33 +762,13 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
             img.extent.origin.x < 0 ? -img.extent.origin.x : 0,
             img.extent.origin.y < 0 ? -img.extent.origin.y : 0)];
     }
-
-    CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
-    if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
-    if (outSize.width < 2 || outSize.height < 2) return NULL;
-
-    OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
-    CVPixelBufferPoolRef pool = NULL;
-    NSDictionary *poolAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(pf),
-        (id)kCVPixelBufferWidthKey: @(outSize.width),
-        (id)kCVPixelBufferHeightKey: @(outSize.height),
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)poolAttrs, &pool);
-    if (!pool) return NULL;
-
-    CVPixelBufferRef dst = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) != kCVReturnSuccess || !dst) {
-        CVPixelBufferPoolRelease(pool);
-        return NULL;
-    }
     [_ci render:img toCVPixelBuffer:dst
            bounds:CGRectMake(0, 0, outSize.width, outSize.height)
        colorSpace:CGColorSpaceCreateDeviceRGB()];
-    CVPixelBufferPoolRelease(pool);
+
+    double ms = (CACurrentMediaTime() - t0) * 1000.0;
     [_lock lock];
-    _lastReason = @"缩放ok";
+    _lastReason = [NSString stringWithFormat:@"CIContext缩放 %.1fms", ms];
     [_lock unlock];
     return dst;
 }
@@ -713,8 +806,14 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
     int maxOut = swr_get_out_samples(_swr, af->nb_samples);
     if (maxOut <= 0) return;
     int ch = (_aOutCh > 0) ? _aOutCh : 2;
-    int16_t *tmp = (int16_t *)malloc((size_t)maxOut * ch * sizeof(int16_t));
-    if (!tmp) return;
+    size_t needBytes = (size_t)maxOut * ch * sizeof(int16_t);
+    if (!_aTmp || _aTmpCap < needBytes) {
+        int16_t *nb = (int16_t *)realloc(_aTmp, needBytes);
+        if (!nb) return;
+        _aTmp = nb;
+        _aTmpCap = needBytes;
+    }
+    int16_t *tmp = _aTmp;
     uint8_t *outPtr[1] = { (uint8_t *)tmp };
     int got = swr_convert(_swr, outPtr, maxOut, (const uint8_t **)af->extended_data, af->nb_samples);
     if (got > 0) {
@@ -733,7 +832,6 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
         }
         [_lock unlock];
     }
-    free(tmp);
 }
 
 - (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames {
