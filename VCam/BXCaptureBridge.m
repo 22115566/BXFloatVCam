@@ -157,18 +157,36 @@ static IMP BXOrigForMethod(NSMutableDictionary *map, Method m) {
 
 static void BXSetSampleBufferDelegate(id self, SEL _cmd, id delegate, dispatch_queue_t queue) {
     // 记住 App 原本的 delegate / queue
-    objc_setAssociatedObject(self, kBXOrigDelegateKey, delegate, OBJC_ASSOCIATION_ASSIGN);
+    // 必须 RETAIN：AVCaptureVideoDataOutput 对 delegate 是弱引用，
+    // 用 ASSIGN 存的话原 delegate 一释放，回调里转发就是野指针 → 进拍摄页必崩。
+    objc_setAssociatedObject(self, kBXOrigDelegateKey, delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(self, kBXOrigQueueKey, queue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     NSLog(@"[BXFloat][vcam] capture delegate bridge installed class=%@ original=%p",
           NSStringFromClass([self class]), (__bridge void *)delegate);
 
-    [BXCaptureBridge shared].capturedOutputs += 1;
+    BOOL isVideoOut = [self isKindOfClass:NSClassFromString(@"AVCaptureVideoDataOutput")];
+    if (isVideoOut) {
+        [BXCaptureBridge shared].capturedOutputs += 1;
+    }
+
+    if (!queue) queue = dispatch_get_main_queue();
 
     Method m = class_getInstanceMethod(object_getClass(self), _cmd);
-    IMP orig = BXOrigForMethod(gSetOrig, m);
+    IMP orig = m ? BXOrigForMethod(gSetOrig, m) : NULL;
+    if (!orig) {
+        // 兜底：这个类可能不是我们直接 swizzle 的那个子类，往上找父类实现
+        Class sup = class_getSuperclass(object_getClass(self));
+        if (sup) {
+            Method sm = class_getInstanceMethod(sup, _cmd);
+            if (sm) orig = method_getImplementation(sm);
+        }
+    }
     if (orig) {
         ((void (*)(id, SEL, id, dispatch_queue_t))orig)(self, _cmd, [BXCaptureBridge shared], queue);
+    } else {
+        NSLog(@"[BXFloat][vcam] 拿不到原始 setSampleBufferDelegate 实现，本轮不接管 %@",
+              NSStringFromClass([self class]));
     }
 }
 
@@ -277,13 +295,42 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         return NULL;
     }
 
+    /*
+     崩溃原因（Aweme-2026-10-31-170141.ips）：
+       *** CFRelease() called with NULL ***   EXC_BREAKPOINT
+       调用栈：BXCaptureBridge captureOutput: → AwemeCore → CFRelease
+     抖音拿到帧后会去读 format description 的扩展字段和 sample buffer 的 attachments，
+     读到 NULL 之后直接 CFRelease —— 系统就断言了。
+     所以这里必须「沿用原帧的 format description 与 attachments」，
+     只替换图像内容，不要造一个干干净净的新 buffer。
+     */
+
+    // 1) 尺寸一致时直接复用原 format description（保留所有扩展字段）
+    CMFormatDescriptionRef origFmt = CMSampleBufferGetFormatDescription(in);
     CMFormatDescriptionRef fmt = NULL;
-    OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
-    if (st != noErr || !fmt) {
+
+    size_t fw = CVPixelBufferGetWidth(frame);
+    size_t fh = CVPixelBufferGetHeight(frame);
+    BOOL sizeMatches = NO;
+    if (origFmt) {
+        CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(origFmt);
+        sizeMatches = ((size_t)d.width == fw && (size_t)d.height == fh);
+    }
+
+    if (sizeMatches) {
+        fmt = (CMFormatDescriptionRef)CFRetain(origFmt);
+    } else {
+        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt) != noErr) {
+            CVPixelBufferRelease(frame);
+            return NULL;
+        }
+    }
+    if (!fmt) {
         CVPixelBufferRelease(frame);
         return NULL;
     }
 
+    // 2) 时间戳沿用原帧
     CMSampleTimingInfo timing;
     if (CMSampleBufferGetSampleTimingInfo(in, 0, &timing) != noErr) {
         timing = (CMSampleTimingInfo){
@@ -294,13 +341,22 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     CMSampleBufferRef out = NULL;
-    st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, fmt, &timing, &out);
+    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, fmt, &timing, &out);
     CFRelease(fmt);
     CVPixelBufferRelease(frame);
-    if (st != noErr) {
+    if (st != noErr || !out) {
         NSLog(@"[BXFloat][vcam] CMSampleBufferCreateReadyWithImageBuffer 失败 %d", (int)st);
         return NULL;
     }
+
+    // 3) 把原帧的 attachments 全部复制过来（这是崩溃的直接修复点）
+    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, in,
+                                                         kCMAttachmentMode_ShouldPropagate);
+    if (atts) {
+        CMSetAttachments(out, atts, kCMAttachmentMode_ShouldPropagate);
+        CFRelease(atts);
+    }
+
     return out;
 }
 
