@@ -13,6 +13,7 @@
 #import "BXStreamVideoSource.h"
 #import "BXFloatStore.h"
 #import "BXConfig.h"
+#import "BXCaptureBridge.h"
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -30,6 +31,7 @@
 @property (nonatomic, assign) BOOL previewing;
 @property (nonatomic, assign) CGSize videoSize;
 @property (nonatomic, assign) BOOL gotFrame;
+@property (nonatomic, assign) BOOL reuseBridge;
 @end
 
 @implementation BXPreviewWindow
@@ -141,6 +143,16 @@
 
     _previewing = YES;
 
+    // 关键：如果采集桥已经连上了同一个地址，就直接复用它的帧。
+    // 开第二路连接会被服务端踢、或者互相抢带宽，结果就是桥梁那路没帧、画面不替换。
+    BXCaptureBridge *bridge = [BXCaptureBridge shared];
+    if (bridge.rtspURL.length && [bridge.rtspURL isEqualToString:url]) {
+        NSLog(@"[BXFloat][preview] 复用采集桥的连接 %@", url);
+        _reuseBridge = YES;
+        [self startTimer];
+        return;
+    }
+
     if ([url hasPrefix:@"rtsp://"]) {
         _rtsp = [BXFFmpegRTSP new];
         __weak typeof(self) weakSelf = self;
@@ -192,6 +204,13 @@
 #pragma mark - 取帧显示
 
 - (void)pumpFrame {
+    if (_reuseBridge) {
+        CVPixelBufferRef px = [[BXCaptureBridge shared] copyLatestStreamFrame];
+        if (!px) return;
+        [self enqueuePixelBuffer:px];
+        CVPixelBufferRelease(px);
+        return;
+    }
     if (!_rtsp.isRunning) return;
     CVPixelBufferRef px = [_rtsp copyNextFrameScaledTo:CGSizeZero];
     if (!px) return;
@@ -251,6 +270,7 @@
 
 // 只停预览自己的解码源。这里刻意不碰 BXCaptureBridge —— 那是另一条独立的连接。
 - (void)stopSources {
+    _reuseBridge = NO;
     [_timer invalidate];
     _timer = nil;
     if (_rtsp) { [_rtsp stop]; _rtsp = nil; }
