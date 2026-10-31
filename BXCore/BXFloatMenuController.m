@@ -323,6 +323,19 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     return nil;
 }
 
+
+- (void)setModalTouch:(BOOL)allow {
+    @try {
+        Class wc = NSClassFromString(@"BXFloatWindow");
+        if (!wc) return;
+        id win = [wc performSelector:NSSelectorFromString(@"shared")];
+        if ([win respondsToSelector:@selector(setAllowAllTouches:)]) {
+            [win setValue:@(allow) forKey:@"allowAllTouches"];
+        }
+    } @catch (NSException *e) {
+    }
+}
+
 - (void)alert:(NSString *)title message:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *host = [self hostVC];
@@ -333,7 +346,9 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                    message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel
+                                             handler:^(UIAlertAction *a) { [self setModalTouch:NO]; }]];
+        [self setModalTouch:YES];
         @try {
             [host presentViewController:ac animated:YES completion:nil];
         } @catch (NSException *e) {
@@ -473,6 +488,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
         [weakSelf startRTSP];
     }]];
 
+    [self setModalTouch:YES];
     @try {
         [host presentViewController:ac animated:YES completion:nil];
     } @catch (NSException *e) {
@@ -491,6 +507,7 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
                                                              inMode:UIDocumentPickerModeImport];
     p.delegate = self;
     p.allowsMultipleSelection = NO;
+    [self setModalTouch:YES];
     @try {
         [host presentViewController:p animated:YES completion:nil];
     } @catch (NSException *e) {
@@ -498,7 +515,12 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
     }
 }
 
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)c {
+    [self setModalTouch:NO];
+}
+
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    [self setModalTouch:NO];
     NSURL *u = urls.firstObject;
     if (!u) return;
     NSError *e = nil;
