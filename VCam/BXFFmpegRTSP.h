@@ -7,8 +7,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreMedia/CoreMedia.h>   // CMTime（按 PTS 取帧要用）
 #import <CoreGraphics/CoreGraphics.h>
-#import <CoreMedia/CoreMedia.h>
 
 @interface BXFFmpegRTSP : NSObject
 
@@ -25,6 +25,9 @@
 @property (nonatomic, readonly) NSString *lastReason;   // 上次取帧失败的原因
 @property (nonatomic, readonly) NSUInteger decodedFrames;
 @property (nonatomic, readonly) NSUInteger droppedFrames;
+
+/// 按摄像头的实际像素格式重建解码输出（420f / 420v 差异会影响色阶）
+- (void)prepareForCameraFormat:(OSType)fmt width:(size_t)w height:(size_t)h;
 
 /// 目标像素格式：设成摄像头的格式后，缩放会直接渲染成该格式，不再二次转换
 @property (nonatomic, assign) OSType targetFormat;
@@ -44,10 +47,11 @@
 /// 取最新音频（S16 交错，48kHz，双声道）。返回写入的帧数，0 表示暂时没有。
 - (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames;
 
+/// 按摄像头 PTS 取最匹配的一帧（音画同步用）。cameraPTS 传 kCMTimeInvalid 等价于取最新帧。
+- (CVPixelBufferRef)copyFrameForCameraPTS:(CMTime)cameraPTS
+                             scaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
+
 /// 取最新一帧（已应用镜像/旋转/缩放）。调用方 CFRelease。
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
-
-/// 按摄像头 PTS 取帧并缩放到指定尺寸（用于对齐摄像头时间戳）
-- (CVPixelBufferRef)copyFrameForCameraPTS:(CMTime)cameraPTS scaledTo:(CGSize)targetSize CF_RETURNS_RETAINED;
 
 @end
