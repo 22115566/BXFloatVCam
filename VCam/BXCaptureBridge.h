@@ -43,6 +43,7 @@
 @property (nonatomic, readonly) NSUInteger decodedFrames;
 @property (nonatomic, readonly) NSString *streamFrameReason;
 @property (nonatomic, readonly) NSString *gateReason;
+@property (nonatomic, readonly) NSString *buildError;
 
 /// 取当前 RTSP/HLS 帧（给预览窗复用，避免开第二路连接）
 - (CVPixelBufferRef)copyLatestStreamFrame CF_RETURNS_RETAINED;
