@@ -21,6 +21,7 @@
 @property (nonatomic, readonly) CGSize size;
 
 /// 统计
+@property (nonatomic, readonly) NSString *lastReason;   // 上次取帧失败的原因
 @property (nonatomic, readonly) NSUInteger decodedFrames;
 @property (nonatomic, readonly) NSUInteger droppedFrames;
 
