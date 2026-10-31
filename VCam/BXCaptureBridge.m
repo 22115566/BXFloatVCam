@@ -26,6 +26,8 @@ static id   BXGetSampleBufferDelegate(id self, SEL _cmd);
 @property (atomic, assign) NSUInteger replacedFrames;
 @property (atomic, assign) NSUInteger passthroughFrames;
 @property (atomic, assign) NSUInteger capturedOutputs;
+@property (nonatomic, assign) NSUInteger attemptFrames;
+@property (nonatomic, copy) NSString *gateReason;
 @end
 
 @implementation BXCaptureBridge
@@ -222,7 +224,16 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // 原来这里只判断 self.source.loaded（本地视频），导致选了 RTSP/HLS 时
     // 根本不会走进替换逻辑 —— 三个来源都要允许。
     BOOL hasAnySource = self.rtsp.isRunning || self.stream.isRunning || self.source.loaded;
+
+    // 记录「为什么没进造帧」，状态面板直接显示，省得反复猜
+    if (isVideo) {
+        if (!self.enabled)          self.gateReason = @"enabled = NO";
+        else if (!hasAnySource)     self.gateReason = @"没有任何可用来源";
+        else                        self.gateReason = @"ok";
+    }
+
     if (isVideo && self.enabled && hasAnySource) {
+        self.attemptFrames += 1;
         @try {
             replacement = [self _replacementForSampleBuffer:sampleBuffer connection:connection];
         } @catch (NSException *e) {
