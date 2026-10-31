@@ -56,6 +56,65 @@ static CVPixelBufferRef BXConvertPixelBuffer(CVPixelBufferRef src, OSType dstFmt
     return dst;
 }
 
+
+// ─────────────────────────────────────────────────────────────
+//  照着百相的做法：不造新的 CMSampleBuffer，
+//  直接把我们的帧「写进摄像头那一帧的 CVPixelBuffer」。
+//  好处：像素格式、attachments、时间戳、格式描述全部天然一致，
+//        不会出现 InvalidMediaFormat(-12743)，也不会 CFRelease(NULL)。
+//  前提：src 与 dst 的尺寸、像素格式一致（调用方负责转换）。
+// ─────────────────────────────────────────────────────────────
+static BOOL BXBlitInto(CVPixelBufferRef dst, CVPixelBufferRef src) {
+    if (!dst || !src) return NO;
+
+    size_t dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+    size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src);
+    if (dw != sw || dh != sh) return NO;
+    if (CVPixelBufferGetPixelFormatType(dst) != CVPixelBufferGetPixelFormatType(src)) return NO;
+
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return NO;
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        return NO;
+    }
+
+    BOOL ok = YES;
+    size_t planes = CVPixelBufferIsPlanar(dst) ? CVPixelBufferGetPlaneCount(dst) : 1;
+
+    for (size_t pl = 0; pl < planes; pl++) {
+        uint8_t *db = CVPixelBufferIsPlanar(dst)
+                    ? (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, pl)
+                    : (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        uint8_t *sb = CVPixelBufferIsPlanar(src)
+                    ? (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, pl)
+                    : (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        if (!db || !sb) { ok = NO; break; }
+
+        size_t dbpr = CVPixelBufferIsPlanar(dst)
+                    ? CVPixelBufferGetBytesPerRowOfPlane(dst, pl)
+                    : CVPixelBufferGetBytesPerRow(dst);
+        size_t sbpr = CVPixelBufferIsPlanar(src)
+                    ? CVPixelBufferGetBytesPerRowOfPlane(src, pl)
+                    : CVPixelBufferGetBytesPerRow(src);
+
+        size_t rows = dh;
+        size_t rowBytes = MIN(dbpr, sbpr);
+        if (CVPixelBufferIsPlanar(dst) && pl > 0) {
+            // 色度平面：高度是亮度的一半
+            rows = (dh + 1) / 2;
+            rowBytes = MIN(dbpr, sbpr);
+        }
+
+        for (size_t y = 0; y < rows; y++) {
+            memcpy(db + y * dbpr, sb + y * sbpr, rowBytes);
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    return ok;
+}
+
 @interface BXCaptureBridge () <AVCaptureVideoDataOutputSampleBufferDelegate,
                               AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) BXVideoSource *source;
@@ -256,52 +315,75 @@ static id BXGetSampleBufferDelegate(id self, SEL _cmd) {
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
 
-    CMSampleBufferRef replacement = NULL;
-    CMSampleBufferRef toSend = sampleBuffer;
-
     BOOL isVideo = [output isKindOfClass:NSClassFromString(@"AVCaptureVideoDataOutput")];
-
-    // 原来这里只判断 self.source.loaded（本地视频），导致选了 RTSP/HLS 时
-    // 根本不会走进替换逻辑 —— 三个来源都要允许。
     BOOL hasAnySource = self.rtsp.isRunning || self.stream.isRunning || self.source.loaded;
 
-    // 记录「为什么没进造帧」，状态面板直接显示，省得反复猜
     if (isVideo) {
-        if (!self.enabled)          self.gateReason = @"enabled = NO";
-        else if (!hasAnySource)     self.gateReason = @"没有任何可用来源";
-        else                        self.gateReason = @"ok";
+        if (!self.enabled)       self.gateReason = @"enabled = NO";
+        else if (!hasAnySource)  self.gateReason = @"没有任何可用来源";
+        else                     self.gateReason = @"ok";
     }
 
     if (isVideo && self.enabled && hasAnySource) {
         self.attemptFrames += 1;
+
+        // 百相的做法：不造新 sample buffer，直接把像素写进摄像头这一帧。
+        // 这样格式/attachments/时间戳天生一致，交给 App 的仍是它自己的 buffer。
         @try {
-            replacement = [self _replacementForSampleBuffer:sampleBuffer connection:connection];
-        } @catch (NSException *e) {
-            NSLog(@"[BXFloat][vcam] 造帧异常 %@", e);
-            replacement = NULL;
-        }
-        if (replacement) {
-            toSend = replacement;
-            self.replacedFrames += 1;
-            if (self.replacedFrames == 1 || self.replacedFrames % 120 == 0) {
-                NSLog(@"[BXFloat][vcam] 已替换 %lu 帧 (直通 %lu)",
-                      (unsigned long)self.replacedFrames,
-                      (unsigned long)self.passthroughFrames);
+            CVImageBufferRef camPx = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (camPx) {
+                CGSize target = CGSizeMake(CVPixelBufferGetWidth(camPx),
+                                           CVPixelBufferGetHeight(camPx));
+                OSType camFmt = CVPixelBufferGetPixelFormatType(camPx);
+
+                CVPixelBufferRef mine = NULL;
+                if (self.rtsp.isRunning)        mine = [self.rtsp copyNextFrameScaledTo:target];
+                else if (self.stream.isRunning) mine = [self.stream copyNextFrameScaledTo:target];
+                else                            mine = [self.source copyNextFrameScaledTo:target];
+
+                if (mine) {
+                    // 把我们的帧转成摄像头同格式（尺寸已经按 target 缩放过）
+                    CVPixelBufferRef conv = BXConvertPixelBuffer(mine, camFmt);
+                    CVPixelBufferRef use = conv ? conv : mine;
+
+                    if (BXBlitInto(camPx, use)) {
+                        self.replacedFrames += 1;
+                        self.buildError = @"已写入摄像头帧";
+                        if (self.replacedFrames == 1 || self.replacedFrames % 120 == 0) {
+                            NSLog(@"[BXFloat][vcam] 已写入 %lu 帧（直通 %lu）",
+                                  (unsigned long)self.replacedFrames,
+                                  (unsigned long)self.passthroughFrames);
+                        }
+                    } else {
+                        self.buildError = [NSString stringWithFormat:@"写入失败 %zux%zu fmt=%08x",
+                                           CVPixelBufferGetWidth(camPx),
+                                           CVPixelBufferGetHeight(camPx),
+                                           (unsigned)camFmt];
+                        self.passthroughFrames += 1;
+                    }
+
+                    if (conv) CVPixelBufferRelease(conv);
+                    CVPixelBufferRelease(mine);
+                } else {
+                    self.buildError = @"取帧为空";
+                    self.passthroughFrames += 1;
+                }
             }
+        } @catch (NSException *e) {
+            NSLog(@"[BXFloat][vcam] 写入异常 %@", e);
+            self.buildError = @"写入异常";
         }
-    }
-    if (!replacement && isVideo) {
+    } else if (isVideo) {
         self.passthroughFrames += 1;
     }
 
+    // 永远转发原始 sample buffer（我们已经改过它的像素内容）
     id orig = objc_getAssociatedObject(output, kBXOrigDelegateKey);
     if ([orig respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
         ((void (*)(id, SEL, id, CMSampleBufferRef, id))objc_msgSend)(
             orig, @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
-            output, toSend, connection);
+            output, sampleBuffer, connection);
     }
-
-    if (replacement) CFRelease(replacement);
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -322,123 +404,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 #pragma mark - 造帧
 
-- (CMSampleBufferRef)_replacementForSampleBuffer:(CMSampleBufferRef)in
-                                      connection:(AVCaptureConnection *)connection {
-    CVImageBufferRef camPx = CMSampleBufferGetImageBuffer(in);
-    if (!camPx) return NULL;
 
-    CGSize target = CGSizeMake(CVPixelBufferGetWidth(camPx),
-                               CVPixelBufferGetHeight(camPx));
-
-    OSType camFmt = CVPixelBufferGetPixelFormatType(camPx);
-    static OSType loggedFmt = 0;
-    if (loggedFmt != camFmt) {
-        loggedFmt = camFmt;
-        NSLog(@"[BXFloat][vcam] 摄像头像素格式 = %c%c%c%c",
-              (char)(camFmt >> 24), (char)(camFmt >> 16), (char)(camFmt >> 8), (char)camFmt);
-    }
-
-    CVPixelBufferRef frame = NULL;
-    if (self.rtsp.isRunning) {
-        frame = [self.rtsp copyNextFrameScaledTo:target];
-    } else if (self.stream.isRunning) {
-        frame = [self.stream copyNextFrameScaledTo:target];
-    } else {
-        frame = [self.source copyNextFrameScaledTo:target];
-    }
-    // 转换到摄像头用的像素格式（通常是 420f），让后面的格式描述能复用、处理链也认
-    OSType camPixelFmt = CVPixelBufferGetPixelFormatType(camPx);
-    CVPixelBufferRef converted = BXConvertPixelBuffer(frame, camPixelFmt);
-    if (converted) {
-        CVPixelBufferRelease(frame);
-        frame = converted;
-        self.buildError = [NSString stringWithFormat:@"转换ok %c%c%c%c",
-                           (char)(camPixelFmt >> 24), (char)(camPixelFmt >> 16),
-                           (char)(camPixelFmt >> 8), (char)camPixelFmt];
-    } else {
-        self.buildError = @"像素格式转换失败";
-        NSLog(@"[BXFloat][vcam] 像素格式转换失败 camFmt=%08x", (unsigned)camPixelFmt);
-    }
-
-    if (!frame) {
-        static NSUInteger nullCount = 0;
-        nullCount++;
-        if (nullCount % 60 == 1) {
-            NSLog(@"[BXFloat][vcam] 取帧为空（累计 %lu），本轮直通", (unsigned long)nullCount);
-        }
-        return NULL;
-    }
-
-    /*
-     崩溃原因（Aweme-2026-10-31-170141.ips）：
-       *** CFRelease() called with NULL ***   EXC_BREAKPOINT
-       调用栈：BXCaptureBridge captureOutput: → AwemeCore → CFRelease
-     抖音拿到帧后会去读 format description 的扩展字段和 sample buffer 的 attachments，
-     读到 NULL 之后直接 CFRelease —— 系统就断言了。
-     所以这里必须「沿用原帧的 format description 与 attachments」，
-     只替换图像内容，不要造一个干干净净的新 buffer。
-     */
-
-    // 1) 始终按「我们自己这一帧」创建 format description。
-    //    之前为了保留扩展字段去复用原帧的格式描述，但两者的尺寸/像素格式
-    //    只要有一点不一致，CoreMedia 就返回 kCMSampleBufferError_InvalidMediaFormat(-12743)。
-    size_t fw = CVPixelBufferGetWidth(frame);
-    size_t fh = CVPixelBufferGetHeight(frame);
-    OSType frameFmt = CVPixelBufferGetPixelFormatType(frame);
-
-    CMFormatDescriptionRef fmt = NULL;
-    OSStatus fe = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
-    if (fe != noErr || !fmt) {
-        self.buildError = [NSString stringWithFormat:@"建fmt失败 st=%d", (int)fe];
-        CVPixelBufferRelease(frame);
-        return NULL;
-    }
-
-    // 2) 时间戳沿用原帧
-    CMSampleTimingInfo timing;
-    if (CMSampleBufferGetSampleTimingInfo(in, 0, &timing) != noErr) {
-        timing = (CMSampleTimingInfo){
-            .duration = CMTimeMake(1, 30),
-            .presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock()),
-            .decodeTimeStamp = kCMTimeInvalid,
-        };
-    }
-
-    // 3) 用 CreateForImageBuffer（比 Ready 变体宽容，不会因为 timing 细节被判非法格式）
-    CMSampleBufferRef out = NULL;
-    OSStatus st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
-                                                     frame,
-                                                     true,
-                                                     NULL,
-                                                     NULL,
-                                                     fmt,
-                                                     &timing,
-                                                     &out);
-    CFRelease(fmt);
-    CVPixelBufferRelease(frame);
-
-    if (st != noErr || !out) {
-        self.buildError = [NSString stringWithFormat:@"建buffer失败 st=%d %zux%zu fmt=%08x",
-                           (int)st, fw, fh, (unsigned)frameFmt];
-        static int logCount = 0;
-        if (logCount < 5) {
-            logCount++;
-            NSLog(@"[BXFloat][vcam] CreateForImageBuffer 失败 st=%d %zux%zu fmt=%08x",
-                  (int)st, fw, fh, (unsigned)frameFmt);
-        }
-        return NULL;
-    }
-
-    // 3) 把原帧的 attachments 全部复制过来（这是崩溃的直接修复点）
-    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, in,
-                                                         kCMAttachmentMode_ShouldPropagate);
-    if (atts) {
-        CMSetAttachments(out, atts, kCMAttachmentMode_ShouldPropagate);
-        CFRelease(atts);
-    }
-
-    self.buildError = @"成功";
-    return out;
-}
 
 @end
