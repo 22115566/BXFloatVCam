@@ -366,13 +366,16 @@ static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 bl
 - (void)statusTapped {
     BXCaptureBridge *b = self.bridge;
     NSString *msg = [NSString stringWithFormat:
-        @"hook：%@\n接管采集：%lu\n已解码：%lu\n已替换：%lu\n直通：%lu\n造帧状态：%@\n来源：%@",
+        @"hook：%@\n启用：%@\n接管采集：%lu\n已解码：%lu\n进入造帧：%lu\n已替换：%lu\n直通：%lu\n造帧：%@ / 判定：%@\n来源：%@",
         b.installed ? @"已装" : @"未装",
+        b.enabled ? @"是" : @"否",
         (unsigned long)b.capturedOutputs,
         (unsigned long)b.decodedFrames,
+        (unsigned long)b.attemptFrames,
         (unsigned long)b.replacedFrames,
         (unsigned long)b.passthroughFrames,
         b.streamFrameReason,
+        b.gateReason ?: @"-",
         b.rtspURL.length ? b.rtspURL : (b.sourcePath ?: @"无")];
     [self alert:@"运行状态" message:msg];
 }
