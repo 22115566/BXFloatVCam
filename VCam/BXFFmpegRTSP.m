@@ -35,6 +35,9 @@
     CIContext       *_ci;
     CVPixelBufferPoolRef _pool;
     CGSize          _poolSize;
+    uint8_t         *_bgra;        // 转换缓冲（按需重分配，绝不沿用启动时的尺寸）
+    size_t          _bgraSize;
+    BOOL            _loopActive;   // 解码线程是否在跑（决定由谁负责释放 ffmpeg 上下文）
 }
 @property (atomic, assign) BOOL running;
 @property (atomic, copy)   NSString *urlString;
@@ -154,6 +157,7 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     NSLog(@"[BXRTSP] 已连接 %@  %dx%d  codec=%s", urlString, _srcW, _srcH, codec->name);
 
     __weak typeof(self) weakSelf = self;
+    _loopActive = YES;
     dispatch_async(_decodeQueue, ^{ [weakSelf decodeLoop]; });
     return YES;
 }
@@ -163,36 +167,42 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
 - (void)decodeLoop {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    uint8_t *bgra = NULL;
-    int bgraStride = _srcW * 4;
-    bgra = (uint8_t *)malloc((size_t)bgraStride * (size_t)_srcH);
 
-    while (!_stopRequested && _fmt && pkt && frame && bgra) {
+    while (!_stopRequested && _fmt && pkt && frame) {
         int ret = av_read_frame(_fmt, pkt);
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN)) { usleep(2000); continue; }
-            NSLog(@"[BXRTSP] 读帧结束/出错 %d，2 秒后重连", ret);
+            NSLog(@"[BXRTSP] 读帧结束/出错 %d", ret);
             break;
         }
         if (pkt->stream_index != _streamIndex) { av_packet_unref(pkt); continue; }
 
         if (avcodec_send_packet(_dec, pkt) == 0) {
             while (avcodec_receive_frame(_dec, frame) == 0) {
-                [self publishFrame:frame bgra:bgra stride:bgraStride];
+                [self publishFrame:frame];
                 av_frame_unref(frame);
             }
         }
         av_packet_unref(pkt);
     }
 
-    free(bgra);
     if (frame) av_frame_free(&frame);
     if (pkt) av_packet_free(&pkt);
+
+    // 上下文只在这里释放：保证不会有人在 av_read_frame 里用着它
+    if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+    if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
+    _loopActive = NO;
 }
 
-- (void)publishFrame:(AVFrame *)frame bgra:(uint8_t *)bgra stride:(int)stride {
-    // 首帧才知道真实分辨率：惰性创建 sws
-    if (!_sws || frame->width != _srcW || frame->height != _srcH) {
+// 关键修复：转换缓冲按「当前帧真实尺寸」分配；sws 与缓冲统一在 _lock 内操作，
+// 避免解码线程和采集线程同时读写导致踩内存（表现为进拍摄页瞬间崩溃）。
+- (void)publishFrame:(AVFrame *)frame {
+    if (!frame || frame->width <= 0 || frame->height <= 0) return;
+
+    [_lock lock];
+
+    if (!_sws || frame->width != _srcW || frame->height != _srcH || (int)frame->format != (int)_srcFmt) {
         if (_sws) { sws_freeContext(_sws); _sws = NULL; }
         _srcW = frame->width;
         _srcH = frame->height;
@@ -201,71 +211,80 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
                               _srcW, _srcH, AV_PIX_FMT_BGRA,
                               SWS_BILINEAR, NULL, NULL, NULL);
         self.size = CGSizeMake(_srcW, _srcH);
-        if (!_sws) {
-            NSLog(@"[BXRTSP] sws 创建失败 %dx%d fmt=%d", _srcW, _srcH, (int)_srcFmt);
-            return;
-        }
+    }
+    if (!_sws) { [_lock unlock]; return; }
+
+    size_t need = (size_t)_srcW * 4u * (size_t)_srcH;
+    if (need == 0) { [_lock unlock]; return; }
+    if (!_bgra || _bgraSize < need) {
+        uint8_t *nb = (uint8_t *)realloc(_bgra, need);
+        if (!nb) { [_lock unlock]; return; }
+        _bgra = nb;
+        _bgraSize = need;
     }
 
-    uint8_t *dst[4] = { bgra, NULL, NULL, NULL };
-    int dstStride[4] = { stride, 0, 0, 0 };
+    uint8_t *dst[4] = { _bgra, NULL, NULL, NULL };
+    int dstStride[4] = { _srcW * 4, 0, 0, 0 };
     sws_scale(_sws, (const uint8_t *const *)frame->data, frame->linesize,
-              0, frame->height, dst, dstStride);
+              0, _srcH, dst, dstStride);
 
     CVPixelBufferRef px = NULL;
     NSDictionary *attrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferWidthKey: @(frame->width),
-        (id)kCVPixelBufferHeightKey: @(frame->height),
+        (id)kCVPixelBufferWidthKey: @(_srcW),
+        (id)kCVPixelBufferHeightKey: @(_srcH),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
-    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)frame->width, (size_t)frame->height,
-                            kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &px) != kCVReturnSuccess || !px) {
+    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)_srcW, (size_t)_srcH,
+                            kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &px) != kCVReturnSuccess || !px) {
+        [_lock unlock];
         return;
     }
+
     CVPixelBufferLockBaseAddress(px, 0);
     uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(px);
-    size_t dstBpr = CVPixelBufferGetBytesPerRow(px);
-    size_t copyBytes = (size_t)MIN((int)dstBpr, stride);
-    for (int y = 0; y < frame->height; y++) {
-        memcpy(base + y * dstBpr, bgra + (size_t)y * stride, copyBytes);
+    size_t bpr = CVPixelBufferGetBytesPerRow(px);
+    size_t rowBytes = MIN((size_t)_srcW * 4u, bpr);
+    for (int y = 0; y < _srcH; y++) {
+        memcpy(base + (size_t)y * bpr, _bgra + (size_t)y * (size_t)(_srcW * 4), rowBytes);
     }
     CVPixelBufferUnlockBaseAddress(px, 0);
 
-    [_lock lock];
     if (_latest) CVPixelBufferRelease(_latest);
-    _latest = px;                       // 转移持有
+    _latest = px;
     self.decodedFrames = self.decodedFrames + 1;
+
     [_lock unlock];
 }
 
 #pragma mark - 取帧
 
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED {
-    CVPixelBufferRef src = NULL;
     [_lock lock];
-    if (_latest) { src = CVPixelBufferRetain(_latest); }
-    [_lock unlock];
-    if (!src) return NULL;
+
+    if (!_latest) { [_lock unlock]; return NULL; }
+    CVPixelBufferRef src = CVPixelBufferRetain(_latest);
 
     BOOL needRotate = (_rotation % 360) != 0;
     BOOL needMirror = _mirror;
+    CGFloat sw = (CGFloat)CVPixelBufferGetWidth(src);
+    CGFloat sh = (CGFloat)CVPixelBufferGetHeight(src);
     BOOL needScale = !CGSizeEqualToSize(targetSize, CGSizeZero) &&
-                     (fabs(targetSize.width - (CGFloat)CVPixelBufferGetWidth(src)) > 1.0 ||
-                      fabs(targetSize.height - (CGFloat)CVPixelBufferGetHeight(src)) > 1.0);
+                     (fabs(targetSize.width - sw) > 1.0 || fabs(targetSize.height - sh) > 1.0);
 
-    if (!needRotate && !needMirror && !needScale) return src;
+    if (!needRotate && !needMirror && !needScale) {
+        [_lock unlock];
+        return src;
+    }
 
     CIImage *img = [CIImage imageWithCVPixelBuffer:src];
-    CGFloat w = (CGFloat)CVPixelBufferGetWidth(src);
-    CGFloat h = (CGFloat)CVPixelBufferGetHeight(src);
-
     if (needScale) {
-        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(targetSize.width / w,
-                                                                      targetSize.height / h)];
+        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(targetSize.width / sw,
+                                                                      targetSize.height / sh)];
     }
     if (needMirror) {
-        CGFloat width = needScale ? targetSize.width : w;
+        CGFloat width = needScale ? targetSize.width : sw;
         img = [img imageByApplyingTransform:CGAffineTransformMakeScale(-1, 1)];
         img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(width, 0)];
     }
@@ -276,8 +295,13 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
             img.extent.origin.y < 0 ? -img.extent.origin.y : 0)];
     }
 
-    CGSize outSize = needScale ? targetSize : CGSizeMake(w, h);
+    CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
     if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
+    if (outSize.width < 2 || outSize.height < 2) {
+        CVPixelBufferRelease(src);
+        [_lock unlock];
+        return NULL;
+    }
 
     if (!_pool || !CGSizeEqualToSize(_poolSize, outSize)) {
         if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
@@ -298,6 +322,7 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
            colorSpace:CGColorSpaceCreateDeviceRGB()];
     }
     CVPixelBufferRelease(src);
+    [_lock unlock];
     return dst;
 }
 
@@ -307,15 +332,20 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     _stopRequested = YES;
     self.running = NO;
 
-    if (_sws) { sws_freeContext(_sws); _sws = NULL; }
-    if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
-    if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
-
     [_lock lock];
+    if (_sws) { sws_freeContext(_sws); _sws = NULL; }
+    if (_bgra) { free(_bgra); _bgra = NULL; _bgraSize = 0; }
     if (_latest) { CVPixelBufferRelease(_latest); _latest = NULL; }
+    if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
     [_lock unlock];
 
-    if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
+    // 解码线程还在跑时不能关上下文（它可能正卡在 av_read_frame）。
+    // 由 decodeLoop 退出时自行释放。
+    if (!_loopActive) {
+        if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+        if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
+    }
+
     self.urlString = nil;
 }
 
