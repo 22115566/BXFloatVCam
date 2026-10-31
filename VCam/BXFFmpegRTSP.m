@@ -18,6 +18,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <unistd.h>
 
 @interface BXFFmpegRTSP () {
@@ -39,6 +40,16 @@
     size_t          _bgraSize;
     BOOL            _loopActive;   // 解码线程是否在跑（决定由谁负责释放 ffmpeg 上下文）
     NSString       *_lastReason;   // 上次取帧失败原因（排查用）
+    int             _aOutRate;     // 当前重采样目标采样率
+    int             _aOutCh;       // 当前重采样目标声道数
+
+    // 音频
+    int             _aStreamIndex;
+    AVCodecContext *_aDec;
+    struct SwrContext *_swr;
+    int16_t        *_aRing;        // 交叉缓冲（S16 48k stereo）
+    size_t          _aRingFrames;  // 容量（帧）
+    size_t          _aFillFrames;  // 已填帧数
 }
 @property (atomic, assign) BOOL running;
 @property (atomic, copy)   NSString *urlString;
@@ -111,6 +122,8 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
         return NO;
     }
 
+    _aStreamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+
     _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (_streamIndex < 0) {
         if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:_streamIndex
@@ -138,6 +151,42 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
                                             userInfo:@{NSLocalizedDescriptionKey: @"解码器初始化失败"}];
         [self stop];
         return NO;
+    }
+
+    // ── 音频：开解码器 + 重采样到 S16/48k/立体声（和摄像头的 LPCM 对齐）──
+    if (_aStreamIndex >= 0) {
+        AVStream *ast = _fmt->streams[_aStreamIndex];
+        const AVCodec *acodec = avcodec_find_decoder(ast->codecpar->codec_id);
+        if (acodec) {
+            _aDec = avcodec_alloc_context3(acodec);
+            avcodec_parameters_to_context(_aDec, ast->codecpar);
+            if (avcodec_open2(_aDec, acodec, NULL) >= 0) {
+                struct SwrContext *swr = NULL;
+                AVChannelLayout outLayout;
+                av_channel_layout_default(&outLayout, 2);
+                AVChannelLayout inLayout;
+                av_channel_layout_copy(&inLayout, &_aDec->ch_layout);
+                swr_alloc_set_opts2(&swr,
+                                    &outLayout, AV_SAMPLE_FMT_S16, 48000,
+                                    &inLayout, _aDec->sample_fmt, _aDec->sample_rate,
+                                    0, NULL);
+                av_channel_layout_uninit(&inLayout);
+                av_channel_layout_uninit(&outLayout);
+                if (swr && swr_init(swr) >= 0) {
+                    _swr = swr;
+                    _aOutCh = 2;
+                    _aOutRate = 48000;
+                    _aRingFrames = 96000;                       // 2 秒
+                    _aRing = (int16_t *)calloc(_aRingFrames * 2, sizeof(int16_t));
+                    _aFillFrames = 0;
+                    NSLog(@"[BXRTSP] 音频轨已就绪 %dHz %dch",
+                          _aDec->sample_rate, _aDec->ch_layout.nb_channels);
+                } else {
+                    if (swr) swr_free(&swr);
+                    NSLog(@"[BXRTSP] 音频重采样器初始化失败");
+                }
+            }
+        }
     }
 
     // 注意：RTSP 的分辨率有时要等第一帧解码后才知道，
@@ -188,6 +237,19 @@ read_again:
             continue;
         }
         reconnect = 0;
+        if (pkt->stream_index == _aStreamIndex && _aDec && _swr) {
+            if (avcodec_send_packet(_aDec, pkt) == 0) {
+                AVFrame *af = av_frame_alloc();
+                while (avcodec_receive_frame(_aDec, af) == 0) {
+                    [self appendAudioFrame:af];
+                    av_frame_unref(af);
+                }
+                av_frame_free(&af);
+            }
+            av_packet_unref(pkt);
+            continue;
+        }
+
         if (pkt->stream_index != _streamIndex) { av_packet_unref(pkt); continue; }
 
         if (avcodec_send_packet(_dec, pkt) == 0) {
@@ -204,6 +266,10 @@ read_again:
 
     // 上下文只在这里释放：保证不会有人在 av_read_frame 里用着它
     if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+    if (_aDec) { avcodec_free_context(&_aDec); _aDec = NULL; }
+    if (_swr) { swr_free(&_swr); _swr = NULL; }
+    if (_aRing) { free(_aRing); _aRing = NULL; }
+    _aFillFrames = 0;
     if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
     _loopActive = NO;
 }
@@ -257,6 +323,96 @@ read_again:
 
     NSLog(@"[BXRTSP] 重连成功 %@", url);
     return YES;
+}
+
+#pragma mark - 音频
+
+- (BOOL)hasAudio { return _aRing != NULL; }
+
+// 摄像头 ASBD 可能是 48k 单声道、44.1k 双声道……必须按它来，
+// 否则声音会变调。之前写死 48k/立体声就是错的。
+- (void)configureAudioSampleRate:(double)rate channels:(int)channels {
+    if (rate < 8000 || rate > 192000) return;
+    if (channels < 1 || channels > 8) return;
+    if (!_aDec) return;
+
+    [_lock lock];
+    if (_swr) { swr_free(&_swr); _swr = NULL; }
+
+    struct SwrContext *swr = NULL;
+    AVChannelLayout outLayout;
+    av_channel_layout_default(&outLayout, channels);
+    AVChannelLayout inLayout;
+    av_channel_layout_copy(&inLayout, &_aDec->ch_layout);
+
+    int rc = swr_alloc_set_opts2(&swr,
+                                 &outLayout, AV_SAMPLE_FMT_S16, (int)rate,
+                                 &inLayout, _aDec->sample_fmt, _aDec->sample_rate,
+                                 0, NULL);
+    av_channel_layout_uninit(&inLayout);
+    av_channel_layout_uninit(&outLayout);
+
+    if (rc == 0 && swr && swr_init(swr) >= 0) {
+        _swr = swr;
+        _aOutRate = (int)rate;
+        _aOutCh = channels;
+        NSLog(@"[BXRTSP] 音频目标对齐摄像头: %dHz %dch", (int)rate, channels);
+    } else {
+        if (swr) swr_free(&swr);
+        NSLog(@"[BXRTSP] 音频重采样目标设置失败");
+    }
+    [_lock unlock];
+}
+
+- (void)appendAudioFrame:(AVFrame *)af {
+    if (!_swr || !_aRing) return;
+
+    int maxOut = swr_get_out_samples(_swr, af->nb_samples);
+    if (maxOut <= 0) return;
+
+    int ch = (_aOutCh > 0) ? _aOutCh : 2;
+    int16_t *tmp = (int16_t *)malloc((size_t)maxOut * ch * sizeof(int16_t));
+    if (!tmp) return;
+
+    uint8_t *outPtr[1] = { (uint8_t *)tmp };
+    int got = swr_convert(_swr, outPtr, maxOut,
+                          (const uint8_t **)af->extended_data, af->nb_samples);
+    if (got > 0) {
+        [_lock lock];
+        if (_aRing) {
+            size_t need = (size_t)got;
+            if (need >= _aRingFrames) need = _aRingFrames;
+            if (_aFillFrames + need > _aRingFrames) {
+                size_t drop = _aFillFrames + need - _aRingFrames;
+                if (drop > _aFillFrames) drop = _aFillFrames;
+                memmove(_aRing, _aRing + drop * ch, (_aFillFrames - drop) * ch * sizeof(int16_t));
+                _aFillFrames -= drop;
+            }
+            memcpy(_aRing + _aFillFrames * ch, tmp + (got - (int)need) * ch, need * ch * sizeof(int16_t));
+            _aFillFrames += need;
+        }
+        [_lock unlock];
+    }
+    free(tmp);
+}
+
+- (int)audioChannels { return (_aOutCh > 0) ? _aOutCh : 2; }
+
+- (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames {
+    if (!dst || maxFrames == 0) return 0;
+    int ch = (_aOutCh > 0) ? _aOutCh : 2;
+    NSUInteger n = 0;
+    [_lock lock];
+    if (_aRing && _aFillFrames > 0) {
+        n = MIN(maxFrames, _aFillFrames);
+        memcpy(dst, _aRing, n * ch * sizeof(int16_t));
+        if (n < _aFillFrames) {
+            memmove(_aRing, _aRing + n * ch, (_aFillFrames - n) * ch * sizeof(int16_t));
+        }
+        _aFillFrames -= n;
+    }
+    [_lock unlock];
+    return n;
 }
 
 - (void)publishFrame:(AVFrame *)frame {
@@ -374,8 +530,9 @@ read_again:
 
     if (!_pool || !CGSizeEqualToSize(_poolSize, outSize)) {
         if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
+        OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
         NSDictionary *poolAttrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferPixelFormatTypeKey: @(pf),
             (id)kCVPixelBufferWidthKey: @(outSize.width),
             (id)kCVPixelBufferHeightKey: @(outSize.height),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
