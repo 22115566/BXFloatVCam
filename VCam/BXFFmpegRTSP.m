@@ -58,6 +58,12 @@ static NSString *BXFFErr(int code) {
     int16_t        *_aRing;
     size_t          _aRingFrames;
     size_t          _aFillFrames;
+    // 音画同步用的解码帧队列（保留最近若干帧 + 各自 PTS）
+    CVPixelBufferRef _qBufs[16];
+    CMTime           _qPts[16];
+    int              _qHead;
+    int              _qCount;
+
     int             _aOutRate;
     int             _aOutCh;
 }
@@ -92,14 +98,79 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
 }
 
 - (void)publishHardwareFrame:(CVImageBufferRef)buffer {
+    [self enqueueFrame:buffer pts:kCMTimeInvalid];
+}
+
+// 入队：保留最近 16 帧（约 0.5 秒），配合摄像头 PTS 做同步
+- (void)enqueueFrame:(CVImageBufferRef)buffer pts:(CMTime)pts {
+    if (!buffer) return;
     [_lock lock];
+
     if (_latest) CVPixelBufferRelease(_latest);
     _latest = (CVPixelBufferRef)CVBufferRetain(buffer);
+
+    if (!CMTIME_IS_VALID(pts)) {
+        // 硬解回调拿不到可靠 PTS 时，用主机时间兜底
+        pts = CMClockGetTime(CMClockGetHostTimeClock());
+    }
+    if (_qCount == 16) {
+        CVPixelBufferRelease(_qBufs[_qHead]);
+        _qPts[_qHead] = kCMTimeInvalid;
+        _qBufs[_qHead] = NULL;
+        _qHead = (_qHead + 1) % 16;
+        _qCount--;
+    }
+    int slot = (_qHead + _qCount) % 16;
+    _qBufs[slot] = (CVPixelBufferRef)CVBufferRetain(buffer);
+    _qPts[slot] = pts;
+    _qCount++;
+
     _lastReason = @"硬解ok";
     self.decodedFrames = self.decodedFrames + 1;
     CGSize sz = CGSizeMake(CVPixelBufferGetWidth(_latest), CVPixelBufferGetHeight(_latest));
     [_lock unlock];
     if (sz.width > 0) self.size = sz;
+}
+
+// 按摄像头 PTS 挑一帧：取「PTS 最接近且不晚于摄像头时间」的那帧
+- (CVPixelBufferRef)dequeueFrameForCameraPTS:(CMTime)cameraPTS CF_RETURNS_RETAINED {
+    CVPixelBufferRef chosen = NULL;
+    [_lock lock];
+
+    if (_qCount == 0) {
+        if (_latest) chosen = CVPixelBufferRetain(_latest);
+        [_lock unlock];
+        return chosen;
+    }
+
+    if (!CMTIME_IS_VALID(cameraPTS)) {
+        int slot = (_qHead + _qCount - 1) % 16;
+        chosen = CVPixelBufferRetain(_qBufs[slot]);
+        [_lock unlock];
+        return chosen;
+    }
+
+    int pick = -1;
+    for (int i = 0; i < _qCount; i++) {
+        int slot = (_qHead + i) % 16;
+        int cmp = CMTimeCompare(_qPts[slot], cameraPTS);
+        if (cmp <= 0) pick = slot;          // 记录最后一个「不晚于摄像头时间」的帧
+    }
+    if (pick < 0) {
+        pick = _qHead;                      // 全都不早于摄像头时间 → 取最早那帧
+    }
+    chosen = CVPixelBufferRetain(_qBufs[pick]);
+
+    // 丢掉它之前的所有帧，避免队列越拖越旧
+    while (_qHead != pick && _qCount > 0) {
+        CVPixelBufferRelease(_qBufs[_qHead]);
+        _qBufs[_qHead] = NULL;
+        _qPts[_qHead] = kCMTimeInvalid;
+        _qHead = (_qHead + 1) % 16;
+        _qCount--;
+    }
+    [_lock unlock];
+    return chosen;
 }
 
 #pragma mark - 生命周期
@@ -218,7 +289,7 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
                     _swr = swr;
                     _aOutRate = 48000;
                     _aOutCh = 2;
-                    _aRingFrames = 96000;
+                    _aRingFrames = 5760;   // ~120ms @48k，限制音画漂移
                     _aRing = (int16_t *)calloc(_aRingFrames * 2, sizeof(int16_t));
                     _aFillFrames = 0;
                 } else if (swr) {
@@ -333,7 +404,10 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
             NSLog(@"[BXRTSP] 读包失败 %@，重连第 %d 次", BXFFErr(ret), reconnect);
             if (_stopRequested || !url.length || reconnect >= 30) break;
             reconnect++;
-            usleep(800 * 1000);
+            // 指数退避：1s, 2s, 4s, 8s，之后固定 15s —— 服务端重启时不用一直猛撞
+            int waitSec = (reconnect >= 4) ? 15 : (1 << (reconnect - 1));
+            NSLog(@"[BXRTSP] 第 %d 次重连，等待 %ds", reconnect, waitSec);
+            usleep((useconds_t)waitSec * 1000 * 1000);
             if (myGen != _generation) break;
             if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
             if (![self reopenForReconnect:url]) break;
@@ -520,6 +594,15 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
 
 #pragma mark - 取帧
 
+- (CVPixelBufferRef)copyFrameForCameraPTS:(CMTime)cameraPTS
+                             scaledTo:(CGSize)targetSize CF_RETURNS_RETAINED {
+    CVPixelBufferRef picked = [self dequeueFrameForCameraPTS:cameraPTS];
+    if (!picked) return NULL;
+    CVPixelBufferRef out = [self transformBuffer:picked toSize:targetSize];
+    CVPixelBufferRelease(picked);
+    return out;
+}
+
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED {
     [_lock lock];
     if (!_latest) {
@@ -528,6 +611,16 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
         return NULL;
     }
     CVPixelBufferRef src = CVPixelBufferRetain(_latest);
+    [_lock unlock];
+    CVPixelBufferRef out = [self transformBuffer:src toSize:targetSize];
+    CVPixelBufferRelease(src);
+    return out;
+}
+
+// 缩放 / 镜像 / 旋转（不含加锁，调用方负责持有 src）
+- (CVPixelBufferRef)transformBuffer:(CVPixelBufferRef)src
+                             toSize:(CGSize)targetSize CF_RETURNS_RETAINED {
+    if (!src) return NULL;
 
     BOOL needRotate = (_rotation % 360) != 0;
     BOOL needMirror = _mirror;
@@ -537,8 +630,7 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
                      (fabs(targetSize.width - sw) > 1.0 || fabs(targetSize.height - sh) > 1.0);
 
     if (!needRotate && !needMirror && !needScale) {
-        [_lock unlock];
-        return src;
+        return (CVPixelBufferRef)CFRetain(src);
     }
 
     CIImage *img = [CIImage imageWithCVPixelBuffer:src];
@@ -560,35 +652,30 @@ static void bx_vt_output(void *refCon, void *frameRefCon,
 
     CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
     if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
-    if (outSize.width < 2 || outSize.height < 2) {
-        CVPixelBufferRelease(src);
-        [_lock unlock];
-        return NULL;
-    }
+    if (outSize.width < 2 || outSize.height < 2) return NULL;
 
     OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
-    if (!_pool || !CGSizeEqualToSize(_poolSize, outSize)) {
-        if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
-        NSDictionary *poolAttrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(pf),
-            (id)kCVPixelBufferWidthKey: @(outSize.width),
-            (id)kCVPixelBufferHeightKey: @(outSize.height),
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        };
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)poolAttrs, &_pool);
-        _poolSize = outSize;
-    }
+    CVPixelBufferPoolRef pool = NULL;
+    NSDictionary *poolAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(pf),
+        (id)kCVPixelBufferWidthKey: @(outSize.width),
+        (id)kCVPixelBufferHeightKey: @(outSize.height),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)poolAttrs, &pool);
+    if (!pool) return NULL;
 
     CVPixelBufferRef dst = NULL;
-    if (_pool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) == kCVReturnSuccess && dst) {
-        [_ci render:img toCVPixelBuffer:dst
-               bounds:CGRectMake(0, 0, outSize.width, outSize.height)
-           colorSpace:CGColorSpaceCreateDeviceRGB()];
-        _lastReason = @"缩放ok";
-    } else {
-        _lastReason = @"像素池取缓冲失败";
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) != kCVReturnSuccess || !dst) {
+        CVPixelBufferPoolRelease(pool);
+        return NULL;
     }
-    CVPixelBufferRelease(src);
+    [_ci render:img toCVPixelBuffer:dst
+           bounds:CGRectMake(0, 0, outSize.width, outSize.height)
+       colorSpace:CGColorSpaceCreateDeviceRGB()];
+    CVPixelBufferPoolRelease(pool);
+    [_lock lock];
+    _lastReason = @"缩放ok";
     [_lock unlock];
     return dst;
 }
