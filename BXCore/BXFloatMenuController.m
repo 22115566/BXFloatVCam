@@ -1,350 +1,186 @@
 //
-//  BXFloatMenuController.m —— 百相风格面板（v2）
+//  BXFloatMenuController.m —— 极简稳定版
 //
-//  视觉对齐百相 0.20.33：
-//    白色圆角卡片 · 标题 + 蓝色圆形关闭按钮 · 状态条 · 三段式来源选择
-//    大号主按钮 · 「快捷调整」两列磁贴 · 底部版本小字
-//
-//  关键修复（v1 的 bug）：
-//    连流 avformat_open_input 是阻塞调用，v1 在主线程里直接调 → 整个界面卡死。
-//    现在全部丢到全局队列，主线程只负责把按钮切成「连接中…」，界面始终可点。
+//  设计原则（针对前几版崩溃的教训）：
+//    1. 不用 UISwitch：开关状态回写一旦被 reload 打断就容易失效，
+//       改成三个大按钮 —— 点一下就是一次明确动作，状态只用于显示。
+//    2. 不用 UIScrollView + 动态重建：面板尺寸由悬浮窗决定（约 300x430），
+//       在 viewDidLayoutSubviews 里按当前尺寸摆位，绝不重建子视图。
+//    3. 弹窗统一从悬浮窗的 rootViewController 出，全部 @try 包住。
+//    4. 耗时动作（连流、选片）一律后台执行，主线程只改 UI。
 //
 
 #import "BXFloatMenuController.h"
 #import "BXFloatStore.h"
 #import "BXCaptureBridge.h"
-#import "BXConfig.h"
 #import "BXPreviewWindow.h"
-#import <QuartzCore/QuartzCore.h>
+#import "BXConfig.h"
 
-#pragma mark - 配色
+#pragma mark - 配色（函数式，调用必须带括号）
 
-static UIColor *C_BG(void)       { return [UIColor whiteColor]; }
-static UIColor *C_TEXT(void)     { return [UIColor colorWithRed:0.11 green:0.11 blue:0.12 alpha:1]; }
-static UIColor *C_SUB(void)      { return [UIColor colorWithRed:0.56 green:0.56 blue:0.58 alpha:1]; }
-static UIColor *C_CARD(void)     { return [UIColor colorWithRed:0.95 green:0.96 blue:0.97 alpha:1]; }
-static UIColor *C_ACCENT(void)   { return [UIColor colorWithRed:0.18 green:0.48 blue:1.00 alpha:1]; }
-static UIColor *C_ACCENT_BG(void){ return [UIColor colorWithRed:0.90 green:0.94 blue:1.00 alpha:1]; }
-static UIColor *C_GREEN(void)    { return [UIColor colorWithRed:0.20 green:0.72 blue:0.42 alpha:1]; }
+static UIColor *C_BG(void)     { return [UIColor whiteColor]; }
+static UIColor *C_TEXT(void)   { return [UIColor colorWithRed:0.11 green:0.11 blue:0.12 alpha:1]; }
+static UIColor *C_SUB(void)    { return [UIColor colorWithRed:0.56 green:0.56 blue:0.58 alpha:1]; }
+static UIColor *C_CARD(void)   { return [UIColor colorWithRed:0.95 green:0.96 blue:0.97 alpha:1]; }
+static UIColor *C_BLUE(void)   { return [UIColor colorWithRed:0.18 green:0.48 blue:1.00 alpha:1]; }
+static UIColor *C_BLUEBG(void) { return [UIColor colorWithRed:0.90 green:0.94 blue:1.00 alpha:1]; }
+static UIColor *C_GREEN(void)  { return [UIColor colorWithRed:0.20 green:0.72 blue:0.42 alpha:1]; }
 
-typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSourceRTSP };
+@interface BXFloatMenuController ()
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UIButton *closeButton;
 
-@interface BXFloatMenuController () <UIDocumentPickerDelegate>
-@property (nonatomic, strong) UIScrollView *scroll;
-@property (nonatomic, strong) UIView *content;
-@property (nonatomic, assign) CGFloat cursor;      // 纵向排版游标
-
+@property (nonatomic, strong) UIView *statusCard;
 @property (nonatomic, strong) UILabel *statusIcon;
 @property (nonatomic, strong) UILabel *statusTitle;
 @property (nonatomic, strong) UILabel *statusDetail;
-@property (nonatomic, strong) UIButton *statusAction;
 
-@property (nonatomic, strong) NSMutableArray<UIButton *> *segButtons;   // 已废弃，保留避免改动过多
-@property (nonatomic, strong) UISwitch *swNone;
-@property (nonatomic, strong) UISwitch *swLocal;
-@property (nonatomic, strong) UISwitch *swRTSP;
-@property (nonatomic, assign) BOOL updatingUI;
-@property (nonatomic, assign) uint64_t connectToken;
-@property (nonatomic, assign) BXSourceKind source;
+@property (nonatomic, strong) UIButton *btnNone;
+@property (nonatomic, strong) UIButton *btnLocal;
+@property (nonatomic, strong) UIButton *btnRTSP;
+@property (nonatomic, strong) UIButton *btnPreview;
+@property (nonatomic, strong) UIButton *btnStatus;
 
-@property (nonatomic, strong) UIButton *primary;
-@property (nonatomic, assign) BOOL connecting;
-
-@property (nonatomic, strong) NSMutableArray<UIView *> *tiles;
-@property (nonatomic, strong) NSMutableArray<UILabel *> *tileValues;
-
-@property (nonatomic, strong) UIDocumentPickerViewController *picker;
-@property (nonatomic, assign) CGFloat builtWidth;
+@property (nonatomic, assign) NSInteger source;   // 0 关闭 / 1 本地 / 2 RTSP
+@property (nonatomic, assign) BOOL busy;
 @end
 
 @implementation BXFloatMenuController
 
-#pragma mark - 生命周期
-
 - (void)viewDidLoad {
     [super viewDidLoad];
-    // 窗口会在展开时设置 frame；这里先给一个默认尺寸，避免用 0 宽排版
     if (self.view.frame.size.width < 100) {
         self.view.frame = CGRectMake(0, 0, 300, 430);
     }
     self.view.backgroundColor = C_BG();
     self.view.layer.cornerRadius = 18;
     self.view.layer.masksToBounds = YES;
-
-    [self buildAll];
+    [self buildUI];
+    [self refresh];
 }
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    CGFloat w = self.view.bounds.size.width;
-    if (w > 100 && fabs(w - self.builtWidth) > 0.5) {
-        [self buildAll];      // 宽度变了（窗口展开时给的尺寸），整体重排
-    }
-}
-
-- (void)buildAll {
-    for (UIView *v in self.view.subviews) {
-        if (v != _scroll) [v removeFromSuperview];
-    }
-    [_scroll removeFromSuperview];
-    _scroll = nil;
-    _content = nil;
-    [_segButtons removeAllObjects];
-    [_tiles removeAllObjects];
-    [_tileValues removeAllObjects];
-    _segButtons = [NSMutableArray array];
-    _tiles = [NSMutableArray array];
-    _tileValues = [NSMutableArray array];
-
-    _builtWidth = self.view.bounds.size.width;
-    _source = [self loadSource];
-    _cursor = 6;
-
-    [self buildScroll];
-    [self buildHeader];
-    [self buildStatus];
-    [self buildSourceSegment];
-    [self buildPrimary];
-    [self buildQuickSection];
-    [self buildFooter];
-    [self finishLayout];
-    [self reload];
-}
-
 
 - (CGFloat)W { return self.view.bounds.size.width; }
-- (CGFloat)pad { return 16; }
 
-#pragma mark - 骨架
+#pragma mark - 建 UI（只建一次）
 
-- (void)buildScroll {
-    _scroll = [[UIScrollView alloc] initWithFrame:self.view.bounds];
-    _scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _scroll.alwaysBounceVertical = YES;
-    _scroll.showsVerticalScrollIndicator = NO;
-    [self.view addSubview:_scroll];
+- (void)buildUI {
+    _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _titleLabel.text = kBXMenuTitle;
+    _titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightBold];
+    _titleLabel.textColor = C_TEXT();
+    [self.view addSubview:_titleLabel];
 
-    _content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, [self W], 400)];
-    _content.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [_scroll addSubview:_content];
-}
+    _closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _closeButton.backgroundColor = C_BLUE();
+    _closeButton.layer.cornerRadius = 17;
+    _closeButton.tintColor = [UIColor whiteColor];
+    _closeButton.imageEdgeInsets = UIEdgeInsetsMake(9, 9, 9, 9);
+    [_closeButton setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
+    [_closeButton addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_closeButton];
 
-// 放一个满宽视图，纵向游标下移
-- (void)addFullWidth:(UIView *)v height:(CGFloat)h gap:(CGFloat)gap {
-    v.frame = CGRectMake([self pad], _cursor + gap, [self W] - [self pad] * 2, h);
-    v.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [_content addSubview:v];
-    _cursor = CGRectGetMaxY(v.frame);
-}
+    _statusCard = [[UIView alloc] initWithFrame:CGRectZero];
+    _statusCard.backgroundColor = C_CARD();
+    _statusCard.layer.cornerRadius = 12;
+    [self.view addSubview:_statusCard];
 
-- (void)finishLayout {
-    _content.frame = CGRectMake(0, 0, [self W], _cursor + 20);
-    _scroll.contentSize = _content.frame.size;
-}
-
-#pragma mark - 头部
-
-- (void)buildHeader {
-    UIView *head = [[UIView alloc] initWithFrame:CGRectMake([self pad], _cursor, [self W] - [self pad] * 2, 34)];
-    head.backgroundColor = [UIColor clearColor];
-
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, [self W] - 90, 30)];
-    title.text = kBXMenuTitle;
-    title.font = [UIFont systemFontOfSize:21 weight:UIFontWeightBold];
-    title.textColor = C_TEXT();
-    [head addSubview:title];
-
-    CGFloat bs = 34;
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
-    close.frame = CGRectMake([self W] - [self pad] * 2 - bs, -2, bs, bs);
-    close.backgroundColor = C_ACCENT();
-    close.layer.cornerRadius = bs / 2.0;
-    close.tintColor = [UIColor whiteColor];
-    close.imageEdgeInsets = UIEdgeInsetsMake(9, 9, 9, 9);
-    [close setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
-    [close addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    head.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [head addSubview:close];
-
-    [_content addSubview:head];
-    _cursor = CGRectGetMaxY(head.frame) + 8;
-}
-
-#pragma mark - 状态条
-
-- (void)buildStatus {
-    UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
-    bar.backgroundColor = C_CARD();
-    bar.layer.cornerRadius = 12;
-
-    _statusIcon = [[UILabel alloc] initWithFrame:CGRectMake(12, 15, 22, 22)];
+    _statusIcon = [[UILabel alloc] initWithFrame:CGRectZero];
     _statusIcon.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
-    _statusIcon.textColor = C_SUB();
     _statusIcon.textAlignment = NSTextAlignmentCenter;
-    _statusIcon.text = @"○";
-    [bar addSubview:_statusIcon];
+    [_statusCard addSubview:_statusIcon];
 
-    _statusTitle = [[UILabel alloc] initWithFrame:CGRectMake(40, 10, [self W] - [self pad] * 2 - 130, 18)];
+    _statusTitle = [[UILabel alloc] initWithFrame:CGRectZero];
     _statusTitle.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     _statusTitle.textColor = C_TEXT();
-    [bar addSubview:_statusTitle];
+    [_statusCard addSubview:_statusTitle];
 
-    _statusDetail = [[UILabel alloc] initWithFrame:CGRectMake(40, 28, [self W] - [self pad] * 2 - 130, 14)];
+    _statusDetail = [[UILabel alloc] initWithFrame:CGRectZero];
     _statusDetail.font = [UIFont systemFontOfSize:11];
     _statusDetail.textColor = C_SUB();
     _statusDetail.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [bar addSubview:_statusDetail];
+    [_statusCard addSubview:_statusDetail];
 
-    _statusAction = [UIButton buttonWithType:UIButtonTypeSystem];
-    _statusAction.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    [_statusAction setTitle:@"地址" forState:UIControlStateNormal];
-    _statusAction.frame = CGRectMake([self W] - [self pad] * 2 - 70, 11, 60, 30);
-    _statusAction.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [_statusAction addTarget:self action:@selector(editURLTapped) forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:_statusAction];
+    _btnNone  = [self sourceButton:@"关闭" sub:@"不替换摄像头" tag:0];
+    _btnLocal = [self sourceButton:@"本地视频" sub:@"用相册里的视频替换" tag:1];
+    _btnRTSP  = [self sourceButton:@"RTSP 拉流" sub:@"用你自己的流替换" tag:2];
 
-    [self addFullWidth:bar height:52 gap:10];
+    _btnPreview = [self actionButton:@"预览流" tag:10];
+    _btnStatus  = [self actionButton:@"运行状态" tag:11];
 }
 
-#pragma mark - 来源三段
+- (UIButton *)sourceButton:(NSString *)title sub:(NSString *)sub tag:(NSInteger)tag {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.tag = tag;
+    b.backgroundColor = C_CARD();
+    b.layer.cornerRadius = 12;
+    b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    b.titleEdgeInsets = UIEdgeInsetsMake(-9, 14, 9, 0);
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:C_TEXT() forState:UIControlStateNormal];
+    [b addTarget:self action:@selector(sourceTapped:) forControlEvents:UIControlEventTouchUpInside];
 
-- (void)buildSourceSegment {
-    UILabel *sec = [[UILabel alloc] initWithFrame:CGRectZero];
-    sec.text = @"替换来源";
-    sec.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    sec.textColor = C_SUB();
-    [self addFullWidth:sec height:16 gap:14];
+    UILabel *s = [[UILabel alloc] initWithFrame:CGRectZero];
+    s.text = sub;
+    s.font = [UIFont systemFontOfSize:11];
+    s.textColor = C_SUB();
+    s.tag = 99;
+    s.userInteractionEnabled = NO;
+    [b addSubview:s];
 
-    UIView *card = [[UIView alloc] initWithFrame:CGRectZero];
-    card.backgroundColor = C_CARD();
-    card.layer.cornerRadius = 12;
+    [self.view addSubview:b];
+    return b;
+}
 
-    CGFloat innerW = [self W] - [self pad] * 2;
-    NSArray *titles = @[@"关闭", @"本地视频", @"RTSP 拉流"];
-    NSArray *subs = @[@"不替换摄像头", @"用相册里的视频替换", @"用网络流替换"];
-    NSMutableArray *sws = [NSMutableArray array];
+- (UIButton *)actionButton:(NSString *)title tag:(NSInteger)tag {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.tag = tag;
+    b.backgroundColor = C_BLUEBG();
+    b.layer.cornerRadius = 12;
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:C_BLUE() forState:UIControlStateNormal];
+    SEL act = (tag == 10) ? @selector(previewTapped) : @selector(statusTapped);
+    [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:b];
+    return b;
+}
 
-    for (NSInteger k = 0; k < 3; k++) {
-        CGFloat y = 6 + k * 52;
+#pragma mark - 摆位
 
-        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(14, y + 6, innerW - 90, 18)];
-        name.text = titles[k];
-        name.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        name.textColor = C_TEXT();
-        [card addSubview:name];
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat w = [self W];
+    if (w < 100) return;
 
-        UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(14, y + 24, innerW - 90, 14)];
-        sub.text = subs[k];
-        sub.font = [UIFont systemFontOfSize:11];
-        sub.textColor = C_SUB();
-        [card addSubview:sub];
+    CGFloat pad = 16;
+    CGFloat cw = w - pad * 2;
+    CGFloat y = 16;
 
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(innerW - 65, y + 12, 51, 31)];
-        sw.tag = k;
-        sw.onTintColor = C_ACCENT();
-        sw.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-        [sw addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
-        [card addSubview:sw];
-        [sws addObject:sw];
+    _titleLabel.frame = CGRectMake(pad, y, cw - 46, 28);
+    _closeButton.frame = CGRectMake(w - pad - 34, y - 2, 34, 34);
+    y += 38;
 
-        if (k < 2) {
-            UIView *line = [[UIView alloc] initWithFrame:CGRectMake(14, y + 47, innerW - 28, 0.5)];
-            line.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
-            [card addSubview:line];
-        }
+    _statusCard.frame = CGRectMake(pad, y, cw, 52);
+    _statusIcon.frame = CGRectMake(12, 15, 22, 22);
+    _statusTitle.frame = CGRectMake(40, 10, cw - 56, 18);
+    _statusDetail.frame = CGRectMake(40, 28, cw - 56, 14);
+    y += 62;
+
+    NSArray *arr = @[_btnNone, _btnLocal, _btnRTSP];
+    for (UIButton *b in arr) {
+        b.frame = CGRectMake(pad, y, cw, 52);
+        UILabel *sub = [b viewWithTag:99];
+        sub.frame = CGRectMake(14, 28, cw - 28, 14);
+        y += 58;
     }
 
-    self.swNone = sws[0];
-    self.swLocal = sws[1];
-    self.swRTSP = sws[2];
-
-    [self addFullWidth:card height:6 + 3 * 52 gap:8];
+    CGFloat half = (cw - 10) / 2.0;
+    _btnPreview.frame = CGRectMake(pad, y, half, 44);
+    _btnStatus.frame  = CGRectMake(pad + half + 10, y, half, 44);
 }
 
-#pragma mark - 主按钮
-
-- (void)buildPrimary {
-    _primary = [UIButton buttonWithType:UIButtonTypeCustom];
-    _primary.layer.cornerRadius = 12;
-    _primary.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    [_primary addTarget:self action:@selector(primaryTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self addFullWidth:_primary height:50 gap:14];
-}
-
-#pragma mark - 快捷调整
-
-- (void)buildQuickSection {
-    UILabel *sec = [[UILabel alloc] initWithFrame:CGRectZero];
-    sec.text = @"快捷调整";
-    sec.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    sec.textColor = C_SUB();
-    [self addFullWidth:sec height:16 gap:16];
-
-    CGFloat gap = 10;
-    CGFloat innerW = [self W] - [self pad] * 2;
-    CGFloat tw = (innerW - gap) / 2.0;
-    NSArray *items = @[
-        @[@"arrow.left.and.right.righttriangle.left.righttriangle.right", @"镜像"],
-        @[@"rotate.right", @"旋转"],
-        @[@"play.rectangle", @"预览"],
-        @[@"film", @"选择视频"],
-        @[@"waveform.path.ecg", @"运行状态"],
-    ];
-
-    CGFloat gridTop = _cursor + 8;
-    for (NSInteger i = 0; i < items.count; i++) {
-        UIView *t = [self tileWithIcon:items[i][0] title:items[i][1] tag:i width:tw];
-        t.frame = CGRectMake([self pad] + (i % 2) * (tw + gap),
-                             gridTop + (i / 2) * (74 + gap), tw, 74);
-        t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        [_content addSubview:t];
-        [_tiles addObject:t];
-    }
-    NSInteger rows = (items.count + 1) / 2;
-    _cursor = gridTop + rows * 74 + (rows - 1) * gap;
-}
-
-- (UIView *)tileWithIcon:(NSString *)icon title:(NSString *)title tag:(NSInteger)tag width:(CGFloat)w {
-    UIView *t = [[UIView alloc] initWithFrame:CGRectZero];
-    t.backgroundColor = C_ACCENT_BG();
-    t.layer.cornerRadius = 12;
-    t.tag = tag;
-    t.userInteractionEnabled = YES;
-    [t addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tileTapped:)]];
-
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(12, 14, 20, 20)];
-    iv.image = [UIImage systemImageNamed:icon];
-    iv.tintColor = C_ACCENT();
-    iv.contentMode = UIViewContentModeScaleAspectFit;
-    [t addSubview:iv];
-
-    UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(12, 38, w - 24, 16)];
-    name.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    name.textColor = C_TEXT();
-    name.text = title;
-    [t addSubview:name];
-
-    UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(12, 54, w - 24, 14)];
-    val.font = [UIFont systemFontOfSize:11];
-    val.textColor = C_SUB();
-    [t addSubview:val];
-    [_tileValues addObject:val];
-    return t;
-}
-
-#pragma mark - 底部
-
-- (void)buildFooter {
-    UILabel *f = [[UILabel alloc] initWithFrame:CGRectZero];
-    f.font = [UIFont systemFontOfSize:10];
-    f.textColor = C_SUB();
-    f.textAlignment = NSTextAlignmentCenter;
-    f.text = [NSString stringWithFormat:@"%@ %@ · local", kBXMenuTitle, kBXVersion];
-    [self addFullWidth:f height:16 gap:18];
-}
-
-#pragma mark - 行为
+#pragma mark - 动作
 
 - (BXCaptureBridge *)bridge { return [BXCaptureBridge shared]; }
 
@@ -353,147 +189,60 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
     return u.length ? u : kBXDefaultStreamURL;
 }
 
-- (BXSourceKind)loadSource {
-    NSString *v = [[BXFloatStore shared] objectForKey:@"bx.vcam.source"];
-    if ([v isEqualToString:@"rtsp"]) return BXSourceRTSP;
-    if ([v isEqualToString:@"local"]) return BXSourceLocal;
-    return BXSourceNone;
-}
-
-- (void)persistSource {
-    NSString *v = (self.source == BXSourceRTSP) ? @"rtsp"
-                 : (self.source == BXSourceLocal) ? @"local" : @"none";
-    [[BXFloatStore shared] setObject:v forKey:@"bx.vcam.source"];
-}
-
-- (UIViewController *)topMost {
-    // 关键：本面板只是被塞进悬浮窗的子视图，不是被 present 出来的控制器。
-    // 从它身上调 presentViewController: 在 iOS 13+ 会抛
-    // "whose view is not in the window hierarchy" —— 表现就是选择器闪退、弹窗没反应。
-    // 所以统一从悬浮窗的 rootViewController 出弹窗。
-    UIViewController *vc = nil;
-
+- (UIViewController *)hostVC {
     Class wc = NSClassFromString(@"BXFloatWindow");
     if (wc && [wc respondsToSelector:NSSelectorFromString(@"shared")]) {
         id win = [wc performSelector:NSSelectorFromString(@"shared")];
         if ([win isKindOfClass:[UIWindow class]]) {
-            vc = [(UIWindow *)win rootViewController];
+            UIViewController *vc = [(UIWindow *)win rootViewController];
+            while (vc.presentedViewController) vc = vc.presentedViewController;
+            if (vc) return vc;
         }
     }
-
-    if (!vc) {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                if (w.isKeyWindow) { vc = w.rootViewController; break; }
-            }
-            if (vc) break;
-        }
-    }
-
-    if (!vc) return nil;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
-- (void)closeTapped {
-    // 关闭 = 停掉一切：断流、关替换、关预览，然后收起面板
-    NSLog(@"[BXFloat][panel] 关闭：停止拉流");
-    [self stopAll];
-    [self persistSource];
-
-    @try {
-        Class pv = NSClassFromString(@"BXPreviewWindow");
-        if (pv) {
-            id shared = [pv performSelector:NSSelectorFromString(@"shared")];
-            SEL hide = NSSelectorFromString(@"hidePreview");
-            if (shared && [shared respondsToSelector:hide]) {
-                [shared performSelector:hide];
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+            if (w.isKeyWindow) {
+                UIViewController *vc = w.rootViewController;
+                while (vc.presentedViewController) vc = vc.presentedViewController;
+                return vc;
             }
         }
-    } @catch (NSException *e) {
-        NSLog(@"[BXFloat][panel] 关预览异常 %@", e);
     }
-
-    [self reload];
-
-    // 交给悬浮窗收起，保持它内部的展开/收起状态一致
-    SEL sel = NSSelectorFromString(@"_collapseMenu");
-    Class winCls = NSClassFromString(@"BXFloatWindow");
-    if (winCls && [winCls respondsToSelector:NSSelectorFromString(@"shared")]) {
-        id shared = [winCls performSelector:NSSelectorFromString(@"shared")];
-        if (shared && [shared respondsToSelector:sel]) {
-            [shared performSelector:sel];
-            return;
-        }
-    }
-    self.view.hidden = YES;
+    return nil;
 }
 
-// 三个开关互斥：打开任意一个，另外两个自动关掉
-- (void)swChanged:(UISwitch *)sw {
-    if (self.updatingUI) return;
-    self.updatingUI = YES;
+- (void)alert:(NSString *)title message:(NSString *)msg {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *host = [self hostVC];
+        if (!host) { NSLog(@"[BXFloat][panel] 无 presenter: %@ %@", title, msg); return; }
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        @try { [host presentViewController:ac animated:YES completion:nil]; }
+        @catch (NSException *e) { NSLog(@"[BXFloat][panel] 弹窗异常 %@", e); }
+    });
+}
 
-    NSInteger k = sw.tag;
-    BXSourceKind want = (k == 2) ? BXSourceRTSP : (k == 1 ? BXSourceLocal : BXSourceNone);
+- (void)sourceTapped:(UIButton *)b {
+    if (self.busy) { NSLog(@"[BXFloat][panel] 忙，忽略点击"); return; }
+    NSInteger want = b.tag;
 
-    // 连接中：只允许「关闭」，其余忽略（防止两路互相打）
-    if (self.connecting && want != BXSourceNone) {
-        self.updatingUI = NO;
-        [self reload];
+    if (want == 0) {
+        [self stopEverything];
+        self.source = 0;
+        [self persistAndRefresh];
         return;
     }
-    if (self.connecting && want == BXSourceNone) {
-        self.connecting = NO;      // 手动中止
-    }
-
-    // 用户把当前已开的那个关掉 -> 视为「关闭」
-    if (!sw.isOn && want == self.source) {
-        want = BXSourceNone;
-    }
-
-    switch (want) {
-        case BXSourceNone:
-            [self stopAll];
-            self.source = BXSourceNone;
-            [self persistSource];
-            break;
-
-        case BXSourceLocal:
-            [self stopNetwork];              // 先把 RTSP 断开，避免两路同时抢
-            self.source = BXSourceLocal;
-            [self persistSource];
-            if (self.bridge.sourcePath.length) {
-                self.bridge.enabled = YES;
-                [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
-            } else {
-                [self presentPicker];        // 还没选片，先让用户选
-            }
-            break;
-
-        case BXSourceRTSP:
-            [self stopNetwork];              // 先断开别的源
-            [self startRTSP];                // 异步连流，成功后自己切状态
-            break;
-    }
-
-    self.updatingUI = NO;
-    [self reload];
-}
-
-- (void)primaryTapped {
-    if (self.connecting) return;
-    if (self.bridge.enabled) {
-        [self stopAll];
-        [self reload];
-        return;
-    }
-    if (self.source == BXSourceLocal) {
+    if (want == 1) {
+        [self stopNetwork];
+        self.source = 1;
+        [self persistAndRefresh];
         if (self.bridge.sourcePath.length) {
             self.bridge.enabled = YES;
             [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
-            [self reload];
+            [self refresh];
         } else {
             [self presentPicker];
         }
@@ -502,30 +251,14 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
     [self startRTSP];
 }
 
-// 核心修复：连流永不在主线程
 - (void)startRTSP {
-    if (self.connecting) return;
+    if (self.busy) return;
     NSString *url = [self savedURL];
-    if (!url.length) { [self editURLTapped]; return; }
+    if (!url.length) { [self promptURL]; return; }
 
-    self.connecting = YES;
-    [self reload];
-
-    // 看门狗：20 秒还没结果就强制复位，避免界面永远停在「连接中…」
-    __weak typeof(self) wdSelf = self;
-    uint64_t token = ++self.connectToken;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(wdSelf) wd = wdSelf;
-        if (!wd) return;
-        if (wd.connectToken != token) return;          // 已经成功/失败过
-        if (!wd.connecting) return;
-        wd.connecting = NO;
-        wd.source = BXSourceNone;
-        [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
-        NSLog(@"[BXFloat][panel] 连接超时（20s），已复位");
-        [wd reload];
-    });
+    self.busy = YES;
+    [self refresh];
+    NSLog(@"[BXFloat][panel] 开始连流 %@", url);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -539,70 +272,38 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
                 ? [s.bridge useRTSPURLString:url error:&err]
                 : [s.bridge useStreamURLString:url error:&err];
         } @catch (NSException *e) {
-            err = [NSError errorWithDomain:@"BXPanel" code:-1
-                                  userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"未知异常"}];
+            err = [NSError errorWithDomain:@"BX" code:-1
+                                  userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"异常"}];
         }
+        NSLog(@"[BXFloat][panel] 连流结果 ok=%d err=%@", (int)ok, err);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) s2 = weakSelf;
             if (!s2) return;
-            s2.connecting = NO;
-            s2.connectToken++;
-
+            s2.busy = NO;
             if (ok) {
                 s2.bridge.enabled = YES;
-                s2.source = BXSourceRTSP;
+                s2.source = 2;
                 [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
                 [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.rtsp.enabled"];
                 [[BXFloatStore shared] setObject:url forKey:@"bx.rtsp.url"];
             } else {
-                s2.source = BXSourceNone;
+                s2.source = 0;
                 [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
-                NSLog(@"[BXFloat][panel] 连流失败: %@", err);
-                UIAlertController *ac =
-                    [UIAlertController alertControllerWithTitle:@"连接失败"
-                                                        message:err.localizedDescription ?: @"无法连接该地址"
-                                                 preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"好"
-                                                      style:UIAlertActionStyleCancel
-                                                    handler:nil]];
-                UIViewController *host = [s2 topMost];
-                if (host) {
-                    @try { [host presentViewController:ac animated:YES completion:nil]; }
-                    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
-                }
+                [s2 alert:@"连接失败" message:err.localizedDescription ?: @"无法连接该地址"];
             }
-            [s2 persistSource];
-            [s2 reload];
+            [s2 persistAndRefresh];
         });
     });
 }
 
-- (void)stopNetwork {
-    [self.bridge stopNetworkSources];
-}
+- (void)promptURL {
+    UIViewController *host = [self hostVC];
+    if (!host) { [self alert:@"打不开输入框" message:@"没有可用的控制器"]; return; }
 
-- (void)stopAll {
-    [self stopNetwork];
-    // 顺手关掉预览窗，保证「关闭」= 一切停止
-    @try {
-        Class pv = NSClassFromString(@"BXPreviewWindow");
-        if (pv) {
-            id shared = [pv performSelector:NSSelectorFromString(@"shared")];
-            SEL hide = NSSelectorFromString(@"hidePreview");
-            if (shared && [shared respondsToSelector:hide]) [shared performSelector:hide];
-        }
-    } @catch (NSException *e) {}
-
-    self.bridge.enabled = NO;
-    [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.vcam.enabled"];
-    [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
-}
-
-- (void)editURLTapped {
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"流地址"
-                         message:@"rtsp://ip:554/路径  或  http://ip:8080/index.m3u8"
+                         message:@"rtsp://ip:554/路径"
                   preferredStyle:UIAlertControllerStyleAlert];
     NSString *cur = [self savedURL];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -622,21 +323,20 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         [[BXFloatStore shared] setObject:u forKey:@"bx.rtsp.url"];
         [weakSelf startRTSP];
     }]];
-    UIViewController *host = [self topMost];
-    if (!host) { NSLog(@"[BXFloat][panel] 没有可用的 presenter"); return; }
     @try { [host presentViewController:ac animated:YES completion:nil]; }
-    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
+    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 输入框异常 %@", e); }
 }
 
 - (void)presentPicker {
-    _picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.movie"]
-                                                                   inMode:UIDocumentPickerModeImport];
-    _picker.delegate = self;
-    _picker.allowsMultipleSelection = NO;
-    UIViewController *host = [self topMost];
-    if (!host) { NSLog(@"[BXFloat][panel] 没有 presenter，无法选片"); return; }
-    @try { [host presentViewController:_picker animated:YES completion:nil]; }
-    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 选择器失败 %@", ex); }
+    UIViewController *host = [self hostVC];
+    if (!host) { [self alert:@"无法选片" message:@"没有可用的控制器"]; return; }
+    UIDocumentPickerViewController *p =
+        [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.movie"]
+                                                             inMode:UIDocumentPickerModeImport];
+    p.delegate = (id<UIDocumentPickerDelegate>)self;
+    p.allowsMultipleSelection = NO;
+    @try { [host presentViewController:p animated:YES completion:nil]; }
+    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 选择器异常 %@", e); }
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
@@ -649,128 +349,124 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         [[BXFloatStore shared] setObject:u.path forKey:@"bx.vcam.path"];
         [[BXFloatStore shared] setObject:@(YES) forKey:@"bx.vcam.enabled"];
         self.bridge.enabled = YES;
-        self.source = BXSourceLocal;
-        [self persistSource];
+        self.source = 1;
+        [self persist];
+    } else {
+        [self alert:@"载入视频失败" message:e.localizedDescription ?: @"未知"];
     }
-    [self reload];
+    [self refresh];
 }
 
-- (void)tileTapped:(UITapGestureRecognizer *)g {
-    NSInteger tag = g.view.tag;
+- (void)previewTapped {
+    NSString *url = self.bridge.rtspURL.length ? self.bridge.rtspURL : [self savedURL];
+    @try { [[BXPreviewWindow shared] showWithURL:url]; }
+    @catch (NSException *e) { NSLog(@"[BXFloat][panel] 预览异常 %@", e); }
+}
+
+- (void)statusTapped {
     BXCaptureBridge *b = self.bridge;
-    BXFloatStore *st = [BXFloatStore shared];
-    switch (tag) {
-        case 0:
-            b.mirror = !b.mirror;
-            [st setObject:@(b.mirror) forKey:@"bx.vcam.mirror"];
-            break;
-        case 1: {
-            NSInteger r = (b.rotation + 90) % 360;
-            b.rotation = r;
-            [st setObject:@(r / 90) forKey:@"bx.vcam.rotation"];
-            break;
-        }
-        case 2:
-            [[BXPreviewWindow shared] showWithURL:[self savedURL]];
-            return;
-        case 3:
-            [self presentPicker];
-            return;
-        case 4: {
-            NSString *msg = [NSString stringWithFormat:
-                @"hook：%@\n接管采集：%lu\n已替换：%lu 帧\n直通：%lu 帧\n来源：%@",
-                b.installed ? @"已装" : @"未装",
-                (unsigned long)b.capturedOutputs,
-                (unsigned long)b.replacedFrames,
-                (unsigned long)b.passthroughFrames,
-                b.rtspURL.length ? b.rtspURL : (b.sourcePath ?: @"无")];
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"运行状态"
-                                                                       message:msg
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-            UIViewController *host = [self topMost];
-    if (!host) { NSLog(@"[BXFloat][panel] 没有可用的 presenter"); return; }
-    @try { [host presentViewController:ac animated:YES completion:nil]; }
-    @catch (NSException *ex) { NSLog(@"[BXFloat][panel] 弹窗失败 %@", ex); }
-            return;
-        }
-        default:
-            break;
-    }
-    [self reload];
+    NSString *msg = [NSString stringWithFormat:
+        @"hook：%@\n接管采集：%lu\n已替换：%lu 帧\n直通：%lu 帧\n来源：%@",
+        b.installed ? @"已装" : @"未装",
+        (unsigned long)b.capturedOutputs,
+        (unsigned long)b.replacedFrames,
+        (unsigned long)b.passthroughFrames,
+        b.rtspURL.length ? b.rtspURL : (b.sourcePath ?: @"无")];
+    [self alert:@"运行状态" message:msg];
 }
 
-#pragma mark - 刷新
+- (void)closeTapped {
+    NSLog(@"[BXFloat][panel] 关闭：全部停止");
+    [self stopEverything];
+    self.source = 0;
+    [self persistAndRefresh];
 
-- (void)reload {
-    if (!_segButtons.count) return;
+    SEL sel = NSSelectorFromString(@"_collapseMenu");
+    Class wc = NSClassFromString(@"BXFloatWindow");
+    if (wc && [wc respondsToSelector:NSSelectorFromString(@"shared")]) {
+        id win = [wc performSelector:NSSelectorFromString(@"shared")];
+        if (win && [win respondsToSelector:sel]) {
+            [win performSelector:sel];
+            return;
+        }
+    }
+    self.view.hidden = YES;
+}
 
-    BXSourceKind cur = self.source;
-    if (self.connecting) cur = BXSourceRTSP;          // 连接中保持 RTSP 开关为开
-    else if (self.bridge.rtspURL.length) cur = BXSourceRTSP;
-    else if (self.bridge.sourcePath.length && cur == BXSourceRTSP) cur = BXSourceLocal;
+#pragma mark - 状态
 
-    if (!self.updatingUI) {
-        self.updatingUI = YES;
-        if (self.swNone)  [self.swNone setOn:(cur == BXSourceNone) animated:YES];
-        if (self.swLocal) [self.swLocal setOn:(cur == BXSourceLocal) animated:YES];
-        if (self.swRTSP)  [self.swRTSP setOn:(cur == BXSourceRTSP) animated:YES];
-        // 三个开关永远可点：连接卡住时用户至少能点「关闭」把它停掉
-        self.swNone.enabled = YES;
-        self.swLocal.enabled = YES;
-        self.swRTSP.enabled = YES;
-        self.updatingUI = NO;
+- (void)stopNetwork {
+    @try { [self.bridge stopNetworkSources]; } @catch (NSException *e) {}
+}
+
+- (void)stopEverything {
+    [self stopNetwork];
+    self.bridge.enabled = NO;
+    [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.vcam.enabled"];
+    [[BXFloatStore shared] setObject:@(NO) forKey:@"bx.rtsp.enabled"];
+    @try {
+        Class pv = NSClassFromString(@"BXPreviewWindow");
+        if (pv) {
+            id shared = [pv performSelector:NSSelectorFromString(@"shared")];
+            SEL hide = NSSelectorFromString(@"hidePreview");
+            if (shared && [shared respondsToSelector:hide]) [shared performSelector:hide];
+        }
+    } @catch (NSException *e) {}
+}
+
+- (void)persist {
+    NSString *v = (self.source == 2) ? @"rtsp" : (self.source == 1 ? @"local" : @"none");
+    [[BXFloatStore shared] setObject:v forKey:@"bx.vcam.source"];
+}
+
+- (void)persistAndRefresh {
+    [self persist];
+    [self refresh];
+}
+
+- (void)refresh {
+    BXCaptureBridge *b = self.bridge;
+    NSString *rtsp = b.rtspURL;
+    NSString *local = b.sourcePath;
+
+    NSInteger cur = self.source;
+    if (rtsp.length) cur = 2;
+    else if (b.enabled && local.length) cur = 1;
+
+    NSArray *arr = @[_btnNone, _btnLocal, _btnRTSP];
+    for (UIButton *x in arr) {
+        BOOL on = (x.tag == cur);
+        x.backgroundColor = on ? C_BLUE() : C_CARD();
+        [x setTitleColor:(on ? [UIColor whiteColor] : C_TEXT()) forState:UIControlStateNormal];
+        UILabel *sub = [x viewWithTag:99];
+        sub.textColor = on ? [UIColor colorWithWhite:1 alpha:0.85] : C_SUB();
     }
 
-    NSString *rtsp = self.bridge.rtspURL;
-    NSString *local = self.bridge.sourcePath;
-    BOOL connected = (cur == BXSourceRTSP && rtsp.length > 0) ||
-                     (cur == BXSourceLocal && local.length > 0);
-
-    if (self.connecting) {
+    if (self.busy) {
         _statusIcon.text = @"⋯";
-        _statusIcon.textColor = C_ACCENT();
+        _statusIcon.textColor = C_BLUE();
         _statusTitle.text = @"连接中…";
         _statusDetail.text = [self savedURL];
-    } else if (connected) {
+    } else if (cur == 2 && rtsp.length) {
         _statusIcon.text = @"✓";
         _statusIcon.textColor = C_GREEN();
-        _statusTitle.text = (cur == BXSourceRTSP) ? @"RTSP 已连接" : @"本地视频";
-        _statusDetail.text = (cur == BXSourceRTSP) ? rtsp : local.lastPathComponent;
+        _statusTitle.text = @"RTSP 已连接";
+        _statusDetail.text = rtsp;
+    } else if (cur == 1 && local.length) {
+        _statusIcon.text = @"✓";
+        _statusIcon.textColor = C_GREEN();
+        _statusTitle.text = @"本地视频";
+        _statusDetail.text = local.lastPathComponent;
     } else {
         _statusIcon.text = @"○";
         _statusIcon.textColor = C_SUB();
         _statusTitle.text = @"未连接";
         _statusDetail.text = [self savedURL];
     }
+}
 
-    NSString *pt;
-    UIColor *bg;
-    UIColor *fg;
-    if (self.connecting) {
-        pt = @"连接中…"; bg = C_CARD(); fg = C_SUB();
-    } else if (self.bridge.enabled) {
-        pt = (cur == BXSourceRTSP) ? @"断开连接" : @"停止替换";
-        bg = C_CARD(); fg = C_TEXT();
-    } else {
-        pt = (cur == BXSourceRTSP) ? @"开始拉流" : @"开始替换";
-        bg = C_ACCENT(); fg = [UIColor whiteColor];
-    }
-    [_primary setTitle:pt forState:UIControlStateNormal];
-    _primary.backgroundColor = bg;
-    [_primary setTitleColor:fg forState:UIControlStateNormal];
-    _primary.enabled = !self.connecting;
-
-    for (NSInteger i = 0; i < _tiles.count && i < _tileValues.count; i++) {
-        UILabel *v = _tileValues[i];
-        switch (i) {
-            case 0: v.text = self.bridge.mirror ? @"开" : @"关闭"; break;
-            case 1: v.text = [NSString stringWithFormat:@"%ld°", (long)self.bridge.rotation]; break;
-            case 2: v.text = self.bridge.sourcePath.length ? self.bridge.sourcePath.lastPathComponent : @"未选择"; break;
-            case 3: v.text = [NSString stringWithFormat:@"%lu 帧", (unsigned long)self.bridge.replacedFrames]; break;
-            default: break;
-        }
-    }
+- (void)reload {
+    [self refresh];
 }
 
 @end
