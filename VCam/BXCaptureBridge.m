@@ -434,8 +434,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
                 CVPixelBufferRef mine = NULL;
                 if (self.rtsp.isRunning) {
-                    self.rtsp.targetFormat = camFmt;      // 直接渲染成摄像头格式，省一次转换
-                    mine = [self.rtsp copyNextFrameScaledTo:target];
+                    self.rtsp.targetFormat = camFmt;
+                    // 音画同步：用「摄像头这一帧的 PTS」去挑一帧解码结果，
+                    // 而不是盲取最新帧。百相就是这么对齐的。
+                    CMTime camPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+                    mine = [self.rtsp copyFrameForCameraPTS:camPTS scaledTo:target];
                 }
                 else if (self.stream.isRunning) mine = [self.stream copyNextFrameScaledTo:target];
                 else                            mine = [self.source copyNextFrameScaledTo:target];
