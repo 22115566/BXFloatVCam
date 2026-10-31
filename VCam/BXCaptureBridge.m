@@ -9,6 +9,7 @@
 #import "BXSwizzle.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <CoreImage/CoreImage.h>
 
 static const void *kBXOrigDelegateKey = &kBXOrigDelegateKey;
 static const void *kBXOrigQueueKey    = &kBXOrigQueueKey;
