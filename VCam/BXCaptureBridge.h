@@ -36,6 +36,13 @@
 
 @property (nonatomic, readonly) NSString *rtspURL;
 
+/// 解码统计（排查用）
+@property (nonatomic, readonly) NSUInteger decodedFrames;
+@property (nonatomic, readonly) NSString *streamFrameReason;
+
+/// 取当前 RTSP/HLS 帧（给预览窗复用，避免开第二路连接）
+- (CVPixelBufferRef)copyLatestStreamFrame CF_RETURNS_RETAINED;
+
 /// 停止 RTSP / 网络流（本地视频不受影响）
 - (void)stopNetworkSources;
 
