@@ -1,17 +1,17 @@
 //
-//  BXFFmpegRTSP.m
+//  BXFFmpegRTSP.m —— RTSP 直连（FFmpeg 拆包 + VideoToolbox 硬解）
 //
-//  FFmpeg 直连 RTSP → 硬件无关的 BGRA CVPixelBuffer。
-//  解码串: av_read_frame → avcodec_send_packet → avcodec_receive_frame
-//          → sws_scale(YUV420P→BGRA) → CVPixelBuffer
-//
-//  线程模型:
-//    后台串行队列持续解码，只保留「最新一帧」，采集桥取帧时直接拿，
-//    既不阻塞摄像头回调，也不会因为积压导致延迟越来越大。
+//  照百相的实现：
+//    · FFmpeg 只负责 RTSP/RTP 拆包（avformat_open_input / av_read_frame）
+//    · 解码交给 VideoToolbox（VTDecompressionSession）→ 硬件解码
+//    · 输出直接是 420f 的 CVPixelBuffer，不需要再做像素格式转换
+//    · 硬解不可用时自动回退到 FFmpeg 软解
 //
 
 #import "BXFFmpegRTSP.h"
+#import <CoreMedia/CoreMedia.h>
 #import <CoreImage/CoreImage.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -19,74 +19,115 @@
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+
+static NSString *BXFFErr(int code) {
+    char buf[256] = {0};
+    av_strerror(code, buf, sizeof(buf));
+    return [NSString stringWithFormat:@"%s(%d)", buf, code];
+}
 
 @interface BXFFmpegRTSP () {
     AVFormatContext *_fmt;
-    AVCodecContext  *_dec;
+    AVCodecContext  *_dec;              // 软解回退时才用
     struct SwsContext *_sws;
     int             _streamIndex;
     int             _srcW, _srcH;
     enum AVPixelFormat _srcFmt;
 
-    CVPixelBufferRef _latest;          // 受 lock 保护
+    CVPixelBufferRef _latest;
     NSLock          *_lock;
     dispatch_queue_t _decodeQueue;
     BOOL            _stopRequested;
     CIContext       *_ci;
     CVPixelBufferPoolRef _pool;
     CGSize          _poolSize;
-    uint8_t         *_bgra;        // 转换缓冲（按需重分配，绝不沿用启动时的尺寸）
+    uint8_t         *_bgra;
     size_t          _bgraSize;
-    BOOL            _loopActive;   // 解码线程是否在跑（决定由谁负责释放 ffmpeg 上下文）
-    NSString       *_lastReason;   // 上次取帧失败原因（排查用）
-    int             _aOutRate;     // 当前重采样目标采样率
-    int             _aOutCh;       // 当前重采样目标声道数
+    BOOL            _loopActive;
+    NSString       *_lastReason;
+    uint64_t        _generation;
 
-    // 音频
+    VTDecompressionSessionRef _vtSession;
+    CMVideoFormatDescriptionRef _vtFmt;
+
     int             _aStreamIndex;
     AVCodecContext *_aDec;
     struct SwrContext *_swr;
-    int16_t        *_aRing;        // 交叉缓冲（S16 48k stereo）
-    size_t          _aRingFrames;  // 容量（帧）
-    size_t          _aFillFrames;  // 已填帧数
+    int16_t        *_aRing;
+    size_t          _aRingFrames;
+    size_t          _aFillFrames;
+    int             _aOutRate;
+    int             _aOutCh;
 }
+
+- (void)publishHardwareFrame:(CVImageBufferRef)buffer;
+- (void)setupVideoToolbox:(AVCodecParameters *)par;
+- (void)feedHardware:(AVPacket *)pkt;
+- (void)publishFrame:(AVFrame *)frame;
+- (void)appendAudioFrame:(AVFrame *)af;
+- (void)decodeLoop;
+- (BOOL)reopenForReconnect:(NSString *)url;
+
 @property (atomic, assign) BOOL running;
 @property (atomic, copy)   NSString *urlString;
 @property (atomic, assign) CGSize size;
 @property (atomic, assign) NSUInteger decodedFrames;
 @property (atomic, assign) NSUInteger droppedFrames;
+
 @end
 
 @implementation BXFFmpegRTSP
 
+#pragma mark - VideoToolbox 输出
+
+static void bx_vt_output(void *refCon, void *frameRefCon,
+                         OSStatus status, VTDecodeInfoFlags flags,
+                         CVImageBufferRef imageBuffer,
+                         CMTime pts, CMTime duration) {
+    if (status != noErr || imageBuffer == NULL) return;
+    BXFFmpegRTSP *me = (__bridge BXFFmpegRTSP *)refCon;
+    [me publishHardwareFrame:imageBuffer];
+}
+
+- (void)publishHardwareFrame:(CVImageBufferRef)buffer {
+    [_lock lock];
+    if (_latest) CVPixelBufferRelease(_latest);
+    _latest = (CVPixelBufferRef)CVBufferRetain(buffer);
+    _lastReason = @"硬解ok";
+    self.decodedFrames = self.decodedFrames + 1;
+    CGSize sz = CGSizeMake(CVPixelBufferGetWidth(_latest), CVPixelBufferGetHeight(_latest));
+    [_lock unlock];
+    if (sz.width > 0) self.size = sz;
+}
+
+#pragma mark - 生命周期
+
 - (instancetype)init {
     if ((self = [super init])) {
         _lock = [NSLock new];
-        _decodeQueue = dispatch_queue_create("bx.ffmpeg.rtsp", DISPATCH_QUEUE_SERIAL);
+        _decodeQueue = dispatch_queue_create("bx.rtsp.decode", DISPATCH_QUEUE_SERIAL);
         _ci = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
         _streamIndex = -1;
+        _aStreamIndex = -1;
     }
     return self;
 }
 
 - (void)dealloc { [self stop]; }
 
-#pragma mark - 启动
+- (BOOL)hasAudio { return _aRing != NULL; }
+- (int)audioChannels { return (_aOutCh > 0) ? _aOutCh : 2; }
+- (NSString *)lastReason { return _lastReason ?: @"-"; }
 
-// 同步打开（只在后台队列调用）
-static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "stimeout", "5000000", 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    int ret = avformat_open_input(outFmt, url, NULL, &opts);
-    av_dict_free(&opts);
-    return ret;
-}
+#pragma mark - 启动
 
 - (BOOL)startWithURLString:(NSString *)urlString error:(NSError **)error {
     [self stop];
+    for (int i = 0; i < 120 && _loopActive; i++) usleep(50 * 1000);
+    _generation++;
+
     if (!urlString.length) {
         if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:1
                                             userInfo:@{NSLocalizedDescriptionKey: @"地址为空"}];
@@ -96,33 +137,29 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     avformat_network_init();
 
     AVDictionary *opts = NULL;
-    // 低延迟关键项
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "stimeout", "5000000", 0);      // 5s 超时（微秒）
+    av_dict_set(&opts, "stimeout", "5000000", 0);
     av_dict_set(&opts, "max_delay", "0", 0);
     av_dict_set(&opts, "reorder_queue_size", "0", 0);
     av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "flags", "low_delay", 0);
-    av_dict_set(&opts, "buffer_size", "1048576", 0);
 
     int ret = avformat_open_input(&_fmt, urlString.UTF8String, NULL, &opts);
     av_dict_free(&opts);
     if (ret < 0 || !_fmt) {
         if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:ret
                                             userInfo:@{NSLocalizedDescriptionKey:
-                                                           [NSString stringWithFormat:@"打开流失败(%d)", ret]}];
+                                                           [NSString stringWithFormat:@"打开流失败 %@", BXFFErr(ret)]}];
         return NO;
     }
 
     ret = avformat_find_stream_info(_fmt, NULL);
     if (ret < 0) {
         if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:ret
-                                            userInfo:@{NSLocalizedDescriptionKey: @"读取流信息失败"}];
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                                                           [NSString stringWithFormat:@"读取流信息失败 %@", BXFFErr(ret)]}];
         [self stop];
         return NO;
     }
-
-    _aStreamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
 
     _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (_streamIndex < 0) {
@@ -133,27 +170,35 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     }
 
     AVStream *st = _fmt->streams[_streamIndex];
-    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!codec) {
-        if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-1
-                                            userInfo:@{NSLocalizedDescriptionKey: @"没有可用解码器"}];
-        [self stop];
-        return NO;
+    _srcW = st->codecpar->width;
+    _srcH = st->codecpar->height;
+
+    if (st->codecpar->codec_id == AV_CODEC_ID_H264) {
+        [self setupVideoToolbox:st->codecpar];
+    }
+    if (!_vtSession) {
+        NSLog(@"[BXRTSP] 硬解不可用，回退软解");
+        const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+        if (!codec) {
+            if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-1
+                                                userInfo:@{NSLocalizedDescriptionKey: @"没有可用解码器"}];
+            [self stop];
+            return NO;
+        }
+        _dec = avcodec_alloc_context3(codec);
+        avcodec_parameters_to_context(_dec, st->codecpar);
+        _dec->thread_count = 2;
+        _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        if (avcodec_open2(_dec, codec, NULL) < 0) {
+            if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-2
+                                                userInfo:@{NSLocalizedDescriptionKey: @"解码器初始化失败"}];
+            [self stop];
+            return NO;
+        }
+        _srcFmt = _dec->pix_fmt;
     }
 
-    _dec = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(_dec, st->codecpar);
-    _dec->thread_count = 2;
-    _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-    if (avcodec_open2(_dec, codec, NULL) < 0) {
-        if (error) *error = [NSError errorWithDomain:@"BXRTSP" code:-2
-                                            userInfo:@{NSLocalizedDescriptionKey: @"解码器初始化失败"}];
-        [self stop];
-        return NO;
-    }
-
-    // ── 音频：开解码器 + 重采样到 S16/48k/立体声（和摄像头的 LPCM 对齐）──
+    _aStreamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (_aStreamIndex >= 0) {
         AVStream *ast = _fmt->streams[_aStreamIndex];
         const AVCodec *acodec = avcodec_find_decoder(ast->codecpar->codec_id);
@@ -162,81 +207,140 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
             avcodec_parameters_to_context(_aDec, ast->codecpar);
             if (avcodec_open2(_aDec, acodec, NULL) >= 0) {
                 struct SwrContext *swr = NULL;
-                AVChannelLayout outLayout;
+                AVChannelLayout outLayout, inLayout;
                 av_channel_layout_default(&outLayout, 2);
-                AVChannelLayout inLayout;
                 av_channel_layout_copy(&inLayout, &_aDec->ch_layout);
-                swr_alloc_set_opts2(&swr,
-                                    &outLayout, AV_SAMPLE_FMT_S16, 48000,
-                                    &inLayout, _aDec->sample_fmt, _aDec->sample_rate,
-                                    0, NULL);
+                swr_alloc_set_opts2(&swr, &outLayout, AV_SAMPLE_FMT_S16, 48000,
+                                    &inLayout, _aDec->sample_fmt, _aDec->sample_rate, 0, NULL);
                 av_channel_layout_uninit(&inLayout);
                 av_channel_layout_uninit(&outLayout);
                 if (swr && swr_init(swr) >= 0) {
                     _swr = swr;
-                    _aOutCh = 2;
                     _aOutRate = 48000;
-                    _aRingFrames = 96000;                       // 2 秒
+                    _aOutCh = 2;
+                    _aRingFrames = 96000;
                     _aRing = (int16_t *)calloc(_aRingFrames * 2, sizeof(int16_t));
                     _aFillFrames = 0;
-                    NSLog(@"[BXRTSP] 音频轨已就绪 %dHz %dch",
-                          _aDec->sample_rate, _aDec->ch_layout.nb_channels);
-                } else {
-                    if (swr) swr_free(&swr);
-                    NSLog(@"[BXRTSP] 音频重采样器初始化失败");
+                } else if (swr) {
+                    swr_free(&swr);
                 }
             }
         }
     }
 
-    // 注意：RTSP 的分辨率有时要等第一帧解码后才知道，
-    // 这里不强制要求宽高，sws 在第一帧时惰性创建。
-    _srcW = _dec->width;
-    _srcH = _dec->height;
-    _srcFmt = _dec->pix_fmt;
-    if (_srcW > 0 && _srcH > 0) {
-        _sws = sws_getContext(_srcW, _srcH, _srcFmt,
-                              _srcW, _srcH, AV_PIX_FMT_BGRA,
-                              SWS_BILINEAR, NULL, NULL, NULL);
-        self.size = CGSizeMake(_srcW, _srcH);
-    }
     self.urlString = urlString;
     self.running = YES;
     _stopRequested = NO;
+    _loopActive = YES;
+    self.size = CGSizeMake(_srcW, _srcH);
 
-    NSLog(@"[BXRTSP] 已连接 %@  %dx%d  codec=%s", urlString, _srcW, _srcH, codec->name);
+    NSLog(@"[BXRTSP] 连接成功 %@  %dx%d  解码=%@  音频=%@",
+          urlString, _srcW, _srcH,
+          _vtSession ? @"VideoToolbox" : @"ffmpeg-sw",
+          _aRing ? @"yes" : @"no");
 
     __weak typeof(self) weakSelf = self;
-    _loopActive = YES;
     dispatch_async(_decodeQueue, ^{ [weakSelf decodeLoop]; });
     return YES;
 }
 
-#pragma mark - 解码循环
+#pragma mark - VideoToolbox 初始化
+
+- (void)setupVideoToolbox:(AVCodecParameters *)par {
+    const uint8_t *ed = par->extradata;
+    int edSize = par->extradata_size;
+    CMFormatDescriptionRef desc = NULL;
+    OSStatus st = (OSStatus)-1;
+
+    if (ed && edSize > 7 && ed[0] == 1) {
+        int numSPS = ed[5] & 0x1F;
+        int idx = 6;
+        const uint8_t *params[16] = {0};
+        size_t sizes[16] = {0};
+        int count = 0;
+
+        for (int i = 0; i < numSPS && idx + 2 <= edSize && count < 16; i++) {
+            int len = (ed[idx] << 8) | ed[idx + 1];
+            idx += 2;
+            if (idx + len > edSize) break;
+            params[count] = ed + idx;
+            sizes[count] = (size_t)len;
+            count++;
+            idx += len;
+        }
+        if (idx + 1 <= edSize) {
+            int numPPS = ed[idx];
+            idx += 1;
+            for (int i = 0; i < numPPS && idx + 2 <= edSize && count < 16; i++) {
+                int len = (ed[idx] << 8) | ed[idx + 1];
+                idx += 2;
+                if (idx + len > edSize) break;
+                params[count] = ed + idx;
+                sizes[count] = (size_t)len;
+                count++;
+                idx += len;
+            }
+        }
+
+        if (count >= 2) {
+            st = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault, count, params, sizes, 4, &desc);
+        }
+    }
+
+    if (st != noErr || !desc) {
+        NSLog(@"[BXRTSP] SPS/PPS 解析失败 st=%d extradata=%d", (int)st, edSize);
+        return;
+    }
+    _vtFmt = desc;
+
+    NSDictionary *dstAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        (id)kCVPixelBufferWidthKey: @(_srcW > 0 ? _srcW : 720),
+        (id)kCVPixelBufferHeightKey: @(_srcH > 0 ? _srcH : 1280),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+
+    VTDecompressionOutputCallbackRecord cb;
+    cb.decompressionOutputCallback = bx_vt_output;
+    cb.decompressionOutputRefCon = (__bridge void *)self;
+
+    OSStatus cs = VTDecompressionSessionCreate(kCFAllocatorDefault, desc, NULL,
+                                               (__bridge CFDictionaryRef)dstAttrs, &cb, &_vtSession);
+    if (cs != noErr || !_vtSession) {
+        NSLog(@"[BXRTSP] VT 会话创建失败 st=%d", (int)cs);
+        if (_vtFmt) { CFRelease(_vtFmt); _vtFmt = NULL; }
+        _vtSession = NULL;
+    } else {
+        VTSessionSetProperty(_vtSession, kVTDecompressionPropertyKey_RealTime,
+                             (__bridge CFTypeRef)@YES);
+    }
+}
+
+#pragma mark - 拆包循环
 
 - (void)decodeLoop {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     NSString *url = self.urlString;
+    uint64_t myGen = _generation;
     int reconnect = 0;
 
-read_again:
-    while (!_stopRequested && _fmt && pkt && frame) {
+    while (!_stopRequested && _fmt && pkt) {
         int ret = av_read_frame(_fmt, pkt);
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN)) { usleep(2000); continue; }
-            NSLog(@"[BXRTSP] 读帧结束/出错 %d，准备重连（第 %d 次）", ret, reconnect);
-            // 断线自动重连：服务端踢掉旧连接、网络抖动都很常见，
-            // 不重连的话画面会永远停在最后一帧（或一直直通真实摄像头）。
+            NSLog(@"[BXRTSP] 读包失败 %@，重连第 %d 次", BXFFErr(ret), reconnect);
             if (_stopRequested || !url.length || reconnect >= 30) break;
             reconnect++;
             usleep(800 * 1000);
+            if (myGen != _generation) break;
             if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
-            if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
             if (![self reopenForReconnect:url]) break;
             continue;
         }
         reconnect = 0;
+
         if (pkt->stream_index == _aStreamIndex && _aDec && _swr) {
             if (avcodec_send_packet(_aDec, pkt) == 0) {
                 AVFrame *af = av_frame_alloc();
@@ -250,12 +354,16 @@ read_again:
             continue;
         }
 
-        if (pkt->stream_index != _streamIndex) { av_packet_unref(pkt); continue; }
-
-        if (avcodec_send_packet(_dec, pkt) == 0) {
-            while (avcodec_receive_frame(_dec, frame) == 0) {
-                [self publishFrame:frame];
-                av_frame_unref(frame);
+        if (pkt->stream_index == _streamIndex) {
+            if (_vtSession) {
+                [self feedHardware:pkt];
+            } else if (_dec) {
+                if (avcodec_send_packet(_dec, pkt) == 0) {
+                    while (avcodec_receive_frame(_dec, frame) == 0) {
+                        [self publishFrame:frame];
+                        av_frame_unref(frame);
+                    }
+                }
             }
         }
         av_packet_unref(pkt);
@@ -264,225 +372,156 @@ read_again:
     if (frame) av_frame_free(&frame);
     if (pkt) av_packet_free(&pkt);
 
-    // 上下文只在这里释放：保证不会有人在 av_read_frame 里用着它
-    if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
-    if (_aDec) { avcodec_free_context(&_aDec); _aDec = NULL; }
-    if (_swr) { swr_free(&_swr); _swr = NULL; }
-    if (_aRing) { free(_aRing); _aRing = NULL; }
-    _aFillFrames = 0;
-    if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
-    _loopActive = NO;
+    if (myGen == _generation) {
+        if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+        if (_aDec) { avcodec_free_context(&_aDec); _aDec = NULL; }
+        if (_swr) { swr_free(&_swr); _swr = NULL; }
+        if (_aRing) { free(_aRing); _aRing = NULL; }
+        _aFillFrames = 0;
+        if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
+        _loopActive = NO;
+    }
 }
 
-// 关键修复：转换缓冲按「当前帧真实尺寸」分配；sws 与缓冲统一在 _lock 内操作，
-// 避免解码线程和采集线程同时读写导致踩内存（表现为进拍摄页瞬间崩溃）。
-// 断线重连：服务端踢旧连接、网络抖动都会导致 av_read_frame 直接失败。
-// 不重连的话画面会永远停在最后一帧（或一直直通真实摄像头）。
-- (BOOL)reopenForReconnect:(NSString *)url {
-    if (_stopRequested || !url.length) return NO;
+// Annex-B / AVCC 统一转成 AVCC（4 字节长度前缀），再喂给 VT
+- (void)feedHardware:(AVPacket *)pkt {
+    const uint8_t *data = pkt->data;
+    int size = pkt->size;
+    if (!data || size < 5 || !_vtFmt) return;
 
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "stimeout", "5000000", 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "max_delay", "0", 0);
+    BOOL annexB = (data[0] == 0 && data[1] == 0 &&
+                   (data[2] == 1 || (data[2] == 0 && data[3] == 1)));
 
-    if (avformat_open_input(&_fmt, url.UTF8String, NULL, &opts) < 0 || !_fmt) {
-        av_dict_free(&opts);
-        NSLog(@"[BXRTSP] 重连打开失败");
-        return NO;
-    }
-    av_dict_free(&opts);
+    NSMutableData *avcc = [NSMutableData dataWithCapacity:(NSUInteger)size + 16];
 
-    if (avformat_find_stream_info(_fmt, NULL) < 0) {
-        NSLog(@"[BXRTSP] 重连读流信息失败");
-        return NO;
-    }
-
-    _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (_streamIndex < 0) {
-        NSLog(@"[BXRTSP] 重连找不到视频流");
-        return NO;
-    }
-
-    AVStream *st = _fmt->streams[_streamIndex];
-    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!codec) {
-        NSLog(@"[BXRTSP] 重连找不到解码器");
-        return NO;
-    }
-
-    _dec = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(_dec, st->codecpar);
-    _dec->thread_count = 2;
-    _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    if (avcodec_open2(_dec, codec, NULL) < 0) {
-        NSLog(@"[BXRTSP] 重连解码器打开失败");
-        return NO;
-    }
-
-    NSLog(@"[BXRTSP] 重连成功 %@", url);
-    return YES;
-}
-
-#pragma mark - 音频
-
-- (BOOL)hasAudio { return _aRing != NULL; }
-
-// 摄像头 ASBD 可能是 48k 单声道、44.1k 双声道……必须按它来，
-// 否则声音会变调。之前写死 48k/立体声就是错的。
-- (void)configureAudioSampleRate:(double)rate channels:(int)channels {
-    if (rate < 8000 || rate > 192000) return;
-    if (channels < 1 || channels > 8) return;
-    if (!_aDec) return;
-
-    [_lock lock];
-    if (_swr) { swr_free(&_swr); _swr = NULL; }
-
-    struct SwrContext *swr = NULL;
-    AVChannelLayout outLayout;
-    av_channel_layout_default(&outLayout, channels);
-    AVChannelLayout inLayout;
-    av_channel_layout_copy(&inLayout, &_aDec->ch_layout);
-
-    int rc = swr_alloc_set_opts2(&swr,
-                                 &outLayout, AV_SAMPLE_FMT_S16, (int)rate,
-                                 &inLayout, _aDec->sample_fmt, _aDec->sample_rate,
-                                 0, NULL);
-    av_channel_layout_uninit(&inLayout);
-    av_channel_layout_uninit(&outLayout);
-
-    if (rc == 0 && swr && swr_init(swr) >= 0) {
-        _swr = swr;
-        _aOutRate = (int)rate;
-        _aOutCh = channels;
-        NSLog(@"[BXRTSP] 音频目标对齐摄像头: %dHz %dch", (int)rate, channels);
-    } else {
-        if (swr) swr_free(&swr);
-        NSLog(@"[BXRTSP] 音频重采样目标设置失败");
-    }
-    [_lock unlock];
-}
-
-- (void)appendAudioFrame:(AVFrame *)af {
-    if (!_swr || !_aRing) return;
-
-    int maxOut = swr_get_out_samples(_swr, af->nb_samples);
-    if (maxOut <= 0) return;
-
-    int ch = (_aOutCh > 0) ? _aOutCh : 2;
-    int16_t *tmp = (int16_t *)malloc((size_t)maxOut * ch * sizeof(int16_t));
-    if (!tmp) return;
-
-    uint8_t *outPtr[1] = { (uint8_t *)tmp };
-    int got = swr_convert(_swr, outPtr, maxOut,
-                          (const uint8_t **)af->extended_data, af->nb_samples);
-    if (got > 0) {
-        [_lock lock];
-        if (_aRing) {
-            size_t need = (size_t)got;
-            if (need >= _aRingFrames) need = _aRingFrames;
-            if (_aFillFrames + need > _aRingFrames) {
-                size_t drop = _aFillFrames + need - _aRingFrames;
-                if (drop > _aFillFrames) drop = _aFillFrames;
-                memmove(_aRing, _aRing + drop * ch, (_aFillFrames - drop) * ch * sizeof(int16_t));
-                _aFillFrames -= drop;
+    if (annexB) {
+        int i = 0;
+        while (i + 3 < size) {
+            int nalStart = -1;
+            int scLen = 0;
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                nalStart = i + 3; scLen = 3;
+            } else if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+                nalStart = i + 4; scLen = 4;
             }
-            memcpy(_aRing + _aFillFrames * ch, tmp + (got - (int)need) * ch, need * ch * sizeof(int16_t));
-            _aFillFrames += need;
+            if (nalStart < 0) { i++; continue; }
+
+            int next = size;
+            for (int j = nalStart; j + 2 < size; j++) {
+                if (data[j] == 0 && data[j + 1] == 0 &&
+                    (data[j + 2] == 1 || (j + 3 < size && data[j + 2] == 0 && data[j + 3] == 1))) {
+                    next = j;
+                    break;
+                }
+            }
+            int len = next - nalStart;
+            if (len > 0) {
+                uint32_t be = htonl((uint32_t)len);
+                [avcc appendBytes:&be length:4];
+                [avcc appendBytes:data + nalStart length:(NSUInteger)len];
+            }
+            i = next + (next < size ? 0 : 0);
+            if (next <= nalStart) i = nalStart;
         }
-        [_lock unlock];
+    } else {
+        [avcc appendBytes:data length:(NSUInteger)size];
     }
-    free(tmp);
+
+    if (avcc.length == 0) return;
+
+    CMBlockBufferRef block = NULL;
+    OSStatus bs = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, avcc.length,
+                                                     kCFAllocatorDefault, NULL, 0, avcc.length,
+                                                     kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (bs != noErr || !block) return;
+    CMBlockBufferReplaceDataBytes(avcc.bytes, block, 0, avcc.length);
+
+    CMTime ts = kCMTimeInvalid;
+    AVRational tb = _fmt->streams[_streamIndex]->time_base;
+    if (pkt->pts != AV_NOPTS_VALUE && tb.den > 0) {
+        ts = CMTimeMake(pkt->pts * (int64_t)tb.num, tb.den);
+    }
+    if (!CMTIME_IS_VALID(ts)) ts = CMClockGetTime(CMClockGetHostTimeClock());
+
+    CMSampleTimingInfo timing = { .duration = CMTimeMake(1, 30),
+                                  .presentationTimeStamp = ts,
+                                  .decodeTimeStamp = kCMTimeInvalid };
+    CMSampleBufferRef sbuf = NULL;
+    size_t sampleSize = avcc.length;
+    OSStatus st = CMSampleBufferCreateReady(kCFAllocatorDefault, block, _vtFmt, 1, 1,
+                                            &timing, 1, &sampleSize, &sbuf);
+    CFRelease(block);
+    if (st != noErr || !sbuf) {
+        static int c = 0;
+        if (c++ < 5) NSLog(@"[BXRTSP] 造 sample buffer 失败 st=%d", (int)st);
+        return;
+    }
+
+    VTDecodeInfoFlags info = 0;
+    VTDecompressionSessionDecodeFrame(_vtSession, sbuf,
+                                      kVTDecodeFrame_EnableAsynchronousDecompression, NULL, &info);
+    CFRelease(sbuf);
 }
 
-- (int)audioChannels { return (_aOutCh > 0) ? _aOutCh : 2; }
-
-- (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames {
-    if (!dst || maxFrames == 0) return 0;
-    int ch = (_aOutCh > 0) ? _aOutCh : 2;
-    NSUInteger n = 0;
-    [_lock lock];
-    if (_aRing && _aFillFrames > 0) {
-        n = MIN(maxFrames, _aFillFrames);
-        memcpy(dst, _aRing, n * ch * sizeof(int16_t));
-        if (n < _aFillFrames) {
-            memmove(_aRing, _aRing + n * ch, (_aFillFrames - n) * ch * sizeof(int16_t));
-        }
-        _aFillFrames -= n;
-    }
-    [_lock unlock];
-    return n;
-}
+#pragma mark - 软解回退
 
 - (void)publishFrame:(AVFrame *)frame {
-    if (!frame || frame->width <= 0 || frame->height <= 0) return;
-
+    if (!frame || frame->width <= 0) return;
     [_lock lock];
-
-    if (!_sws || frame->width != _srcW || frame->height != _srcH || (int)frame->format != (int)_srcFmt) {
+    if (!_sws || frame->width != _srcW || frame->height != _srcH) {
         if (_sws) { sws_freeContext(_sws); _sws = NULL; }
         _srcW = frame->width;
         _srcH = frame->height;
         _srcFmt = (enum AVPixelFormat)frame->format;
-        _sws = sws_getContext(_srcW, _srcH, _srcFmt,
-                              _srcW, _srcH, AV_PIX_FMT_BGRA,
+        _sws = sws_getContext(_srcW, _srcH, _srcFmt, _srcW, _srcH, AV_PIX_FMT_BGRA,
                               SWS_BILINEAR, NULL, NULL, NULL);
-        self.size = CGSizeMake(_srcW, _srcH);
     }
     if (!_sws) { [_lock unlock]; return; }
 
-    size_t need = (size_t)_srcW * 4u * (size_t)_srcH;
-    if (need == 0) { [_lock unlock]; return; }
+    size_t need = (size_t)_srcW * 4 * (size_t)_srcH;
     if (!_bgra || _bgraSize < need) {
-        uint8_t *nb = (uint8_t *)realloc(_bgra, need);
+        uint8_t *nb = realloc(_bgra, need);
         if (!nb) { [_lock unlock]; return; }
         _bgra = nb;
         _bgraSize = need;
     }
-
     uint8_t *dst[4] = { _bgra, NULL, NULL, NULL };
     int dstStride[4] = { _srcW * 4, 0, 0, 0 };
-    sws_scale(_sws, (const uint8_t *const *)frame->data, frame->linesize,
-              0, _srcH, dst, dstStride);
+    sws_scale(_sws, (const uint8_t *const *)frame->data, frame->linesize, 0, _srcH, dst, dstStride);
 
-    CVPixelBufferRef px = NULL;
     NSDictionary *attrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferWidthKey: @(_srcW),
         (id)kCVPixelBufferHeightKey: @(_srcH),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
+    CVPixelBufferRef px = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)_srcW, (size_t)_srcH,
                             kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)attrs, &px) != kCVReturnSuccess || !px) {
         [_lock unlock];
         return;
     }
-
     CVPixelBufferLockBaseAddress(px, 0);
     uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(px);
     size_t bpr = CVPixelBufferGetBytesPerRow(px);
-    size_t rowBytes = MIN((size_t)_srcW * 4u, bpr);
     for (int y = 0; y < _srcH; y++) {
-        memcpy(base + (size_t)y * bpr, _bgra + (size_t)y * (size_t)(_srcW * 4), rowBytes);
+        memcpy(base + (size_t)y * bpr, _bgra + (size_t)y * (size_t)(_srcW * 4),
+               MIN((size_t)_srcW * 4, bpr));
     }
     CVPixelBufferUnlockBaseAddress(px, 0);
 
     if (_latest) CVPixelBufferRelease(_latest);
     _latest = px;
+    _lastReason = @"软解ok";
     self.decodedFrames = self.decodedFrames + 1;
-
     [_lock unlock];
 }
 
 #pragma mark - 取帧
 
-- (NSString *)lastReason { return _lastReason ?: @"-"; }
-
 - (CVPixelBufferRef)copyNextFrameScaledTo:(CGSize)targetSize CF_RETURNS_RETAINED {
     [_lock lock];
-
     if (!_latest) {
         _lastReason = self.running ? @"解码还没出帧" : @"未连接";
         [_lock unlock];
@@ -522,15 +561,14 @@ read_again:
     CGSize outSize = needScale ? targetSize : CGSizeMake(sw, sh);
     if (_rotation == 90 || _rotation == 270) outSize = CGSizeMake(outSize.height, outSize.width);
     if (outSize.width < 2 || outSize.height < 2) {
-        _lastReason = [NSString stringWithFormat:@"目标尺寸异常 %.0fx%.0f", outSize.width, outSize.height];
         CVPixelBufferRelease(src);
         [_lock unlock];
         return NULL;
     }
 
+    OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
     if (!_pool || !CGSizeEqualToSize(_poolSize, outSize)) {
         if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
-        OSType pf = self.targetFormat ? self.targetFormat : kCVPixelFormatType_32BGRA;
         NSDictionary *poolAttrs = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(pf),
             (id)kCVPixelBufferWidthKey: @(outSize.width),
@@ -542,26 +580,135 @@ read_again:
     }
 
     CVPixelBufferRef dst = NULL;
-    if (!_pool) {
-        _lastReason = @"像素池创建失败";
-    } else if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) != kCVReturnSuccess || !dst) {
-        _lastReason = @"像素池取缓冲失败";
-    } else {
+    if (_pool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) == kCVReturnSuccess && dst) {
         [_ci render:img toCVPixelBuffer:dst
                bounds:CGRectMake(0, 0, outSize.width, outSize.height)
-          colorSpace:CGColorSpaceCreateDeviceRGB()];
-        _lastReason = @"ok";
+           colorSpace:CGColorSpaceCreateDeviceRGB()];
+        _lastReason = @"缩放ok";
+    } else {
+        _lastReason = @"像素池取缓冲失败";
     }
     CVPixelBufferRelease(src);
     [_lock unlock];
     return dst;
 }
 
-#pragma mark - 停止
+#pragma mark - 音频
+
+- (void)configureAudioSampleRate:(double)rate channels:(int)channels {
+    if (rate < 8000 || rate > 192000) return;
+    if (channels < 1 || channels > 8) return;
+    if (!_aDec) return;
+
+    [_lock lock];
+    if (_swr) { swr_free(&_swr); _swr = NULL; }
+    struct SwrContext *swr = NULL;
+    AVChannelLayout outLayout, inLayout;
+    av_channel_layout_default(&outLayout, channels);
+    av_channel_layout_copy(&inLayout, &_aDec->ch_layout);
+    int rc = swr_alloc_set_opts2(&swr, &outLayout, AV_SAMPLE_FMT_S16, (int)rate,
+                                 &inLayout, _aDec->sample_fmt, _aDec->sample_rate, 0, NULL);
+    av_channel_layout_uninit(&inLayout);
+    av_channel_layout_uninit(&outLayout);
+    if (rc == 0 && swr && swr_init(swr) >= 0) {
+        _swr = swr;
+        _aOutRate = (int)rate;
+        _aOutCh = channels;
+        NSLog(@"[BXRTSP] 音频目标对齐摄像头: %dHz %dch", (int)rate, channels);
+    } else if (swr) {
+        swr_free(&swr);
+    }
+    [_lock unlock];
+}
+
+- (void)appendAudioFrame:(AVFrame *)af {
+    if (!_swr || !_aRing) return;
+    int maxOut = swr_get_out_samples(_swr, af->nb_samples);
+    if (maxOut <= 0) return;
+    int ch = (_aOutCh > 0) ? _aOutCh : 2;
+    int16_t *tmp = (int16_t *)malloc((size_t)maxOut * ch * sizeof(int16_t));
+    if (!tmp) return;
+    uint8_t *outPtr[1] = { (uint8_t *)tmp };
+    int got = swr_convert(_swr, outPtr, maxOut, (const uint8_t **)af->extended_data, af->nb_samples);
+    if (got > 0) {
+        [_lock lock];
+        if (_aRing) {
+            size_t need = (size_t)got;
+            if (need >= _aRingFrames) need = _aRingFrames;
+            if (_aFillFrames + need > _aRingFrames) {
+                size_t drop = _aFillFrames + need - _aRingFrames;
+                if (drop > _aFillFrames) drop = _aFillFrames;
+                memmove(_aRing, _aRing + drop * ch, (_aFillFrames - drop) * ch * sizeof(int16_t));
+                _aFillFrames -= drop;
+            }
+            memcpy(_aRing + _aFillFrames * ch, tmp + (got - (int)need) * ch, need * ch * sizeof(int16_t));
+            _aFillFrames += need;
+        }
+        [_lock unlock];
+    }
+    free(tmp);
+}
+
+- (NSUInteger)copyAudioS16:(int16_t *)dst maxFrames:(NSUInteger)maxFrames {
+    if (!dst || maxFrames == 0) return 0;
+    int ch = (_aOutCh > 0) ? _aOutCh : 2;
+    NSUInteger n = 0;
+    [_lock lock];
+    if (_aRing && _aFillFrames > 0) {
+        n = MIN(maxFrames, _aFillFrames);
+        memcpy(dst, _aRing, n * ch * sizeof(int16_t));
+        if (n < _aFillFrames) {
+            memmove(_aRing, _aRing + n * ch, (_aFillFrames - n) * ch * sizeof(int16_t));
+        }
+        _aFillFrames -= n;
+    }
+    [_lock unlock];
+    return n;
+}
+
+#pragma mark - 重连 / 停止
+
+- (BOOL)reopenForReconnect:(NSString *)url {
+    if (_stopRequested || !url.length) return NO;
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "stimeout", "5000000", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    if (avformat_open_input(&_fmt, url.UTF8String, NULL, &opts) < 0 || !_fmt) {
+        av_dict_free(&opts);
+        return NO;
+    }
+    av_dict_free(&opts);
+    if (avformat_find_stream_info(_fmt, NULL) < 0) return NO;
+
+    _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (_streamIndex < 0) return NO;
+
+    if (!_vtSession) {
+        AVStream *st = _fmt->streams[_streamIndex];
+        const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+        if (!codec) return NO;
+        _dec = avcodec_alloc_context3(codec);
+        avcodec_parameters_to_context(_dec, st->codecpar);
+        _dec->thread_count = 2;
+        _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        if (avcodec_open2(_dec, codec, NULL) < 0) return NO;
+    }
+    NSLog(@"[BXRTSP] 重连成功 %@", url);
+    return YES;
+}
 
 - (void)stop {
     _stopRequested = YES;
     self.running = NO;
+
+    if (_vtSession) {
+        VTDecompressionSessionWaitForAsynchronousFrames(_vtSession);
+        VTDecompressionSessionInvalidate(_vtSession);
+        CFRelease(_vtSession);
+        _vtSession = NULL;
+    }
+    if (_vtFmt) { CFRelease(_vtFmt); _vtFmt = NULL; }
 
     [_lock lock];
     if (_sws) { sws_freeContext(_sws); _sws = NULL; }
@@ -570,13 +717,14 @@ read_again:
     if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
     [_lock unlock];
 
-    // 解码线程还在跑时不能关上下文（它可能正卡在 av_read_frame）。
-    // 由 decodeLoop 退出时自行释放。
     if (!_loopActive) {
         if (_dec) { avcodec_free_context(&_dec); _dec = NULL; }
+        if (_aDec) { avcodec_free_context(&_aDec); _aDec = NULL; }
+        if (_swr) { swr_free(&_swr); _swr = NULL; }
+        if (_aRing) { free(_aRing); _aRing = NULL; }
+        _aFillFrames = 0;
         if (_fmt) { avformat_close_input(&_fmt); _fmt = NULL; }
     }
-
     self.urlString = nil;
 }
 
