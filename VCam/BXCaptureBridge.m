@@ -192,8 +192,16 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
     BOOL isVideo = [output isKindOfClass:NSClassFromString(@"AVCaptureVideoDataOutput")];
 
-    if (isVideo && self.enabled && self.source.loaded) {
-        replacement = [self _replacementForSampleBuffer:sampleBuffer connection:connection];
+    // 原来这里只判断 self.source.loaded（本地视频），导致选了 RTSP/HLS 时
+    // 根本不会走进替换逻辑 —— 三个来源都要允许。
+    BOOL hasAnySource = self.rtsp.isRunning || self.stream.isRunning || self.source.loaded;
+    if (isVideo && self.enabled && hasAnySource) {
+        @try {
+            replacement = [self _replacementForSampleBuffer:sampleBuffer connection:connection];
+        } @catch (NSException *e) {
+            NSLog(@"[BXFloat][vcam] 造帧异常 %@", e);
+            replacement = NULL;
+        }
         if (replacement) {
             toSend = replacement;
             self.replacedFrames += 1;
@@ -260,7 +268,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     } else {
         frame = [self.source copyNextFrameScaledTo:target];
     }
-    if (!frame) return NULL;
+    if (!frame) {
+        static NSUInteger nullCount = 0;
+        nullCount++;
+        if (nullCount % 60 == 1) {
+            NSLog(@"[BXFloat][vcam] 取帧为空（累计 %lu），本轮直通", (unsigned long)nullCount);
+        }
+        return NULL;
+    }
 
     CMFormatDescriptionRef fmt = NULL;
     OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
