@@ -115,6 +115,89 @@ static BOOL BXBlitInto(CVPixelBufferRef dst, CVPixelBufferRef src) {
     return ok;
 }
 
+
+// ─────────────────────────────────────────────────────────────
+//  音频替换：和视频一样，直接写进摄像头那一帧的 PCM，不造新的 sample buffer。
+//  AVCaptureAudioDataOutput 给的是 LPCM（常见 48k / Float32 / 单或双声道），
+//  我们把 RTSP 的音频重采样成 S16/48k/立体声，再按目标格式落进去。
+// ─────────────────────────────────────────────────────────────
+static BOOL BXBlitAudio(CMSampleBufferRef sbuf, BXFFmpegRTSP *src) {
+    if (!sbuf || !src || ![src hasAudio]) return NO;
+
+    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sbuf);
+    if (!fd) return NO;
+    const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+    if (!asbd) return NO;
+    if (asbd->mSampleRate < 1) return NO;
+
+    AudioBufferList abl;
+    size_t ablSize = sizeof(abl);
+    CMBlockBufferRef block = NULL;
+    OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sbuf, &ablSize, &abl, sizeof(abl), NULL, NULL,
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block);
+    if (st != noErr || block == NULL) return NO;
+    if (abl.mNumberBuffers < 1 || abl.mBuffers[0].mData == NULL) {
+        CFRelease(block);
+        return NO;
+    }
+
+    UInt32 ch = asbd->mChannelsPerFrame ? asbd->mChannelsPerFrame : 1;
+
+    // 照百相的做法：用摄像头真实的 ASBD 校准重采样目标（参数变了就重配）
+    static double sLastRate = 0;
+    static int sLastCh = 0;
+    if (sLastRate != asbd->mSampleRate || sLastCh != (int)ch) {
+        [src configureAudioSampleRate:asbd->mSampleRate channels:(int)ch];
+        sLastRate = asbd->mSampleRate;
+        sLastCh = (int)ch;
+    }
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL nonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    UInt32 bytesPerFrame = isFloat ? 4 * ch : 2 * ch;
+    if (bytesPerFrame == 0) { CFRelease(block); return NO; }
+
+    UInt32 frames = abl.mBuffers[0].mDataByteSize / bytesPerFrame;
+    if (frames == 0) { CFRelease(block); return NO; }
+
+    int outCh = [src audioChannels];
+    if (outCh < 1) outCh = 1;
+    int16_t *pcm = (int16_t *)malloc((size_t)frames * outCh * sizeof(int16_t));
+    if (!pcm) { CFRelease(block); return NO; }
+
+    NSUInteger got = [src copyAudioS16:pcm maxFrames:frames];
+    if (got == 0) { free(pcm); CFRelease(block); return NO; }
+
+    uint8_t *dstBase = (uint8_t *)abl.mBuffers[0].mData;
+
+    for (NSUInteger f = 0; f < got; f++) {
+        int16_t l = pcm[f * outCh];
+        int16_t r = (outCh > 1) ? pcm[f * outCh + 1] : l;
+        if (ch >= 2) {
+            if (isFloat) {
+                float *d = (float *)(dstBase + f * bytesPerFrame);
+                d[0] = l / 32768.0f;
+                d[1] = r / 32768.0f;
+            } else {
+                int16_t *d = (int16_t *)(dstBase + f * bytesPerFrame);
+                d[0] = l;
+                d[1] = r;
+            }
+        } else {
+            int16_t mono = (int16_t)(((int)l + (int)r) / 2);
+            if (isFloat) {
+                ((float *)(dstBase + f * bytesPerFrame))[0] = mono / 32768.0f;
+            } else {
+                ((int16_t *)(dstBase + f * bytesPerFrame))[0] = mono;
+            }
+        }
+    }
+
+    free(pcm);
+    CFRelease(block);
+    return (got > 0);
+}
+
 @interface BXCaptureBridge () <AVCaptureVideoDataOutputSampleBufferDelegate,
                               AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) BXVideoSource *source;
@@ -125,6 +208,7 @@ static BOOL BXBlitInto(CVPixelBufferRef dst, CVPixelBufferRef src) {
 @property (atomic, assign) NSUInteger passthroughFrames;
 @property (atomic, assign) NSUInteger capturedOutputs;
 @property (nonatomic, assign) NSUInteger attemptFrames;
+@property (nonatomic, assign) NSUInteger audioReplaced;
 @property (nonatomic, copy) NSString *gateReason;
 @property (nonatomic, copy) NSString *buildError;
 @end
@@ -144,6 +228,7 @@ static BOOL BXBlitInto(CVPixelBufferRef dst, CVPixelBufferRef src) {
         _stream = [BXStreamVideoSource new];
         _rtsp = [BXFFmpegRTSP new];
         _enabled = NO;
+        _audioReplace = YES;
         _installed = NO;
     }
     return self;
@@ -324,6 +409,17 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         else                     self.gateReason = @"ok";
     }
 
+    // 音频：和视频同一套思路，直接写进摄像头 PCM
+    if (!isVideo && self.enabled && self.rtsp.isRunning && self.audioReplace) {
+        @try {
+            if (BXBlitAudio(sampleBuffer, self.rtsp)) {
+                self.audioReplaced += 1;
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[BXFloat][vcam] 音频写入异常 %@", e);
+        }
+    }
+
     if (isVideo && self.enabled && hasAnySource) {
         self.attemptFrames += 1;
 
@@ -337,7 +433,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 OSType camFmt = CVPixelBufferGetPixelFormatType(camPx);
 
                 CVPixelBufferRef mine = NULL;
-                if (self.rtsp.isRunning)        mine = [self.rtsp copyNextFrameScaledTo:target];
+                if (self.rtsp.isRunning) {
+                    self.rtsp.targetFormat = camFmt;      // 直接渲染成摄像头格式，省一次转换
+                    mine = [self.rtsp copyNextFrameScaledTo:target];
+                }
                 else if (self.stream.isRunning) mine = [self.stream copyNextFrameScaledTo:target];
                 else                            mine = [self.source copyNextFrameScaledTo:target];
 
