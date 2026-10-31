@@ -45,8 +45,6 @@
 @property (atomic, assign) CGSize size;
 @property (atomic, assign) NSUInteger decodedFrames;
 @property (atomic, assign) NSUInteger droppedFrames;
-
-- (BOOL)reopenForReconnect:(NSString *)urlString;
 @end
 
 @implementation BXFFmpegRTSP
@@ -165,71 +163,6 @@ static int bx_open_sync(AVFormatContext **outFmt, const char *url) {
     return YES;
 }
 
-// 断线重连用：只重新打开流和解码器，不重启整个队列
-- (BOOL)reopenForReconnect:(NSString *)urlString {
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "stimeout", "5000000", 0);
-    av_dict_set(&opts, "max_delay", "0", 0);
-    av_dict_set(&opts, "reorder_queue_size", "0", 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "flags", "low_delay", 0);
-    av_dict_set(&opts, "buffer_size", "1048576", 0);
-
-    int ret = avformat_open_input(&_fmt, urlString.UTF8String, NULL, &opts);
-    av_dict_free(&opts);
-    if (ret < 0 || !_fmt) {
-        _lastReason = [NSString stringWithFormat:@"重连打开失败(%d)", ret];
-        return NO;
-    }
-
-    ret = avformat_find_stream_info(_fmt, NULL);
-    if (ret < 0) {
-        avformat_close_input(&_fmt); _fmt = NULL;
-        _lastReason = @"重连读取流信息失败";
-        return NO;
-    }
-
-    _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (_streamIndex < 0) {
-        avformat_close_input(&_fmt); _fmt = NULL;
-        _lastReason = @"重连没有视频流";
-        return NO;
-    }
-
-    AVStream *st = _fmt->streams[_streamIndex];
-    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!codec) {
-        avformat_close_input(&_fmt); _fmt = NULL;
-        _lastReason = @"重连没有可用解码器";
-        return NO;
-    }
-
-    _dec = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(_dec, st->codecpar);
-    _dec->thread_count = 2;
-    _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-
-    if (avcodec_open2(_dec, codec, NULL) < 0) {
-        avcodec_free_context(&_dec); _dec = NULL;
-        avformat_close_input(&_fmt); _fmt = NULL;
-        _lastReason = @"重连解码器初始化失败";
-        return NO;
-    }
-
-    _srcW = _dec->width;
-    _srcH = _dec->height;
-    _srcFmt = _dec->pix_fmt;
-    if (_srcW > 0 && _srcH > 0) {
-        if (_sws) { sws_freeContext(_sws); _sws = NULL; }
-        _sws = sws_getContext(_srcW, _srcH, _srcFmt,
-                              _srcW, _srcH, AV_PIX_FMT_BGRA,
-                              SWS_BILINEAR, NULL, NULL, NULL);
-        self.size = CGSizeMake(_srcW, _srcH);
-    }
-    return YES;
-}
-
 #pragma mark - 解码循环
 
 - (void)decodeLoop {
@@ -277,6 +210,55 @@ read_again:
 
 // 关键修复：转换缓冲按「当前帧真实尺寸」分配；sws 与缓冲统一在 _lock 内操作，
 // 避免解码线程和采集线程同时读写导致踩内存（表现为进拍摄页瞬间崩溃）。
+// 断线重连：服务端踢旧连接、网络抖动都会导致 av_read_frame 直接失败。
+// 不重连的话画面会永远停在最后一帧（或一直直通真实摄像头）。
+- (BOOL)reopenForReconnect:(NSString *)url {
+    if (_stopRequested || !url.length) return NO;
+
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "stimeout", "5000000", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "max_delay", "0", 0);
+
+    if (avformat_open_input(&_fmt, url.UTF8String, NULL, &opts) < 0 || !_fmt) {
+        av_dict_free(&opts);
+        NSLog(@"[BXRTSP] 重连打开失败");
+        return NO;
+    }
+    av_dict_free(&opts);
+
+    if (avformat_find_stream_info(_fmt, NULL) < 0) {
+        NSLog(@"[BXRTSP] 重连读流信息失败");
+        return NO;
+    }
+
+    _streamIndex = av_find_best_stream(_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (_streamIndex < 0) {
+        NSLog(@"[BXRTSP] 重连找不到视频流");
+        return NO;
+    }
+
+    AVStream *st = _fmt->streams[_streamIndex];
+    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        NSLog(@"[BXRTSP] 重连找不到解码器");
+        return NO;
+    }
+
+    _dec = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(_dec, st->codecpar);
+    _dec->thread_count = 2;
+    _dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    if (avcodec_open2(_dec, codec, NULL) < 0) {
+        NSLog(@"[BXRTSP] 重连解码器打开失败");
+        return NO;
+    }
+
+    NSLog(@"[BXRTSP] 重连成功 %@", url);
+    return YES;
+}
+
 - (void)publishFrame:(AVFrame *)frame {
     if (!frame || frame->width <= 0 || frame->height <= 0) return;
 
