@@ -150,7 +150,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, [self W] - 90, 30)];
     title.text = kBXMenuTitle;
     title.font = [UIFont systemFontOfSize:21 weight:UIFontWeightBold];
-    title.textColor = C_TEXT;
+    title.textColor = C_TEXT();
     [head addSubview:title];
 
     CGFloat bs = 34;
@@ -186,7 +186,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
 
     _statusTitle = [[UILabel alloc] initWithFrame:CGRectMake(40, 10, [self W] - [self pad] * 2 - 130, 18)];
     _statusTitle.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    _statusTitle.textColor = C_TEXT;
+    _statusTitle.textColor = C_TEXT();
     [bar addSubview:_statusTitle];
 
     _statusDetail = [[UILabel alloc] initWithFrame:CGRectMake(40, 28, [self W] - [self pad] * 2 - 130, 14)];
@@ -230,7 +230,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(14, y + 6, innerW - 90, 18)];
         name.text = titles[k];
         name.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        name.textColor = C_TEXT;
+        name.textColor = C_TEXT();
         [card addSubview:name];
 
         UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(14, y + 24, innerW - 90, 14)];
@@ -320,7 +320,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
 
     UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(12, 38, w - 24, 16)];
     name.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    name.textColor = C_TEXT;
+    name.textColor = C_TEXT();
     name.text = title;
     [t addSubview:name];
 
@@ -686,7 +686,7 @@ typedef NS_ENUM(NSInteger, BXSourceKind) { BXSourceNone = 0, BXSourceLocal, BXSo
         pt = @"连接中…"; bg = C_CARD(); fg = C_SUB();
     } else if (self.bridge.enabled) {
         pt = (cur == BXSourceRTSP) ? @"断开连接" : @"停止替换";
-        bg = C_CARD(); fg = C_TEXT;
+        bg = C_CARD(); fg = C_TEXT();
     } else {
         pt = (cur == BXSourceRTSP) ? @"开始拉流" : @"开始替换";
         bg = C_ACCENT(); fg = [UIColor whiteColor];
