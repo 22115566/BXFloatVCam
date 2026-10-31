@@ -9,7 +9,7 @@
 #import "BXSwizzle.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <CoreImage/CoreImage.h>
+#import <CoreImage/CoreImage.h>   // CIContext / CIImage（像素格式转换要用）
 
 static const void *kBXOrigDelegateKey = &kBXOrigDelegateKey;
 static const void *kBXOrigQueueKey    = &kBXOrigQueueKey;
@@ -379,45 +379,17 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      只替换图像内容，不要造一个干干净净的新 buffer。
      */
 
-    // 1) 复用原 format description —— 但必须「尺寸 + 像素格式」都一致。
-    //    摄像头一般是 420f（YUV），我们造的是 BGRA；把 420f 的 format description
-    //    套在 BGRA 缓冲上，CMSampleBufferCreateReadyWithImageBuffer 会直接校验失败返回 NULL，
-    //    表现就是「进入造帧很多次、已替换永远是 0」。
-    CMFormatDescriptionRef origFmt = CMSampleBufferGetFormatDescription(in);
-    CMFormatDescriptionRef fmt = NULL;
-
+    // 1) 始终按「我们自己这一帧」创建 format description。
+    //    之前为了保留扩展字段去复用原帧的格式描述，但两者的尺寸/像素格式
+    //    只要有一点不一致，CoreMedia 就返回 kCMSampleBufferError_InvalidMediaFormat(-12743)。
     size_t fw = CVPixelBufferGetWidth(frame);
     size_t fh = CVPixelBufferGetHeight(frame);
     OSType frameFmt = CVPixelBufferGetPixelFormatType(frame);
 
-    BOOL canReuse = NO;
-    if (origFmt) {
-        CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(origFmt);
-        OSType origSub = CMFormatDescriptionGetMediaSubType(origFmt);
-        canReuse = ((size_t)d.width == fw &&
-                    (size_t)d.height == fh &&
-                    origSub == frameFmt);
-        static OSType loggedSub = 0;
-        if (loggedSub != origSub) {
-            loggedSub = origSub;
-            NSLog(@"[BXFloat][vcam] 摄像头 format subtype=%c%c%c%c 我们的帧=%c%c%c%c",
-                  (char)(origSub >> 24), (char)(origSub >> 16), (char)(origSub >> 8), (char)origSub,
-                  (char)(frameFmt >> 24), (char)(frameFmt >> 16), (char)(frameFmt >> 8), (char)frameFmt);
-        }
-    }
-
-    if (canReuse) {
-        fmt = (CMFormatDescriptionRef)CFRetain(origFmt);
-    } else {
-        OSStatus fe = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
-        if (fe != noErr || !fmt) {
-            self.buildError = [NSString stringWithFormat:@"建fmt失败 st=%d", (int)fe];
-            NSLog(@"[BXFloat][vcam] 建 format description 失败 %d", (int)fe);
-            CVPixelBufferRelease(frame);
-            return NULL;
-        }
-    }
-    if (!fmt) {
+    CMFormatDescriptionRef fmt = NULL;
+    OSStatus fe = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &fmt);
+    if (fe != noErr || !fmt) {
+        self.buildError = [NSString stringWithFormat:@"建fmt失败 st=%d", (int)fe];
         CVPixelBufferRelease(frame);
         return NULL;
     }
@@ -432,20 +404,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         };
     }
 
+    // 3) 用 CreateForImageBuffer（比 Ready 变体宽容，不会因为 timing 细节被判非法格式）
     CMSampleBufferRef out = NULL;
-    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, fmt, &timing, &out);
+    OSStatus st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
+                                                     frame,
+                                                     true,
+                                                     NULL,
+                                                     NULL,
+                                                     fmt,
+                                                     &timing,
+                                                     &out);
     CFRelease(fmt);
     CVPixelBufferRelease(frame);
+
     if (st != noErr || !out) {
+        self.buildError = [NSString stringWithFormat:@"建buffer失败 st=%d %zux%zu fmt=%08x",
+                           (int)st, fw, fh, (unsigned)frameFmt];
         static int logCount = 0;
-        self.buildError = [NSString stringWithFormat:@"建buffer失败 st=%d %zux%zu",
-                           (int)st, fw, fh];
         if (logCount < 5) {
             logCount++;
-            NSLog(@"[BXFloat][vcam] CMSampleBufferCreateReadyWithImageBuffer 失败 st=%d fmt=%c%c%c%c %zux%zu",
-                  (int)st,
-                  (char)(frameFmt >> 24), (char)(frameFmt >> 16), (char)(frameFmt >> 8), (char)frameFmt,
-                  fw, fh);
+            NSLog(@"[BXFloat][vcam] CreateForImageBuffer 失败 st=%d %zux%zu fmt=%08x",
+                  (int)st, fw, fh, (unsigned)frameFmt);
         }
         return NULL;
     }
